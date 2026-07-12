@@ -4,18 +4,36 @@
   "description": "A vitest-like unit test framework for skills and agents",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.19"
+  },
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./config": "./src/config.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    }
   },
   "bin": {
-    "agentfoo": "./src/cli.ts"
+    "agentfoo": "./dist/cli.js"
   },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
     "typecheck": "tsc --noEmit",
-    "example": "cd example && node ../src/cli.ts run"
+    "example": "cd example && node ../src/cli.ts run",
+    "prepublishOnly": "npm run build && npm run test && npm run typecheck"
   },
   "dependencies": {
     "vitest": "^3.2.7"
