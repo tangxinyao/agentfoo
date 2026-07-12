@@ -5,7 +5,7 @@ vitest DSL you already know; agentfoo adds the pieces that make testing an agent
 practical: booting the agent in a container, detecting when a skill was actually
 pulled in, and grading free-form output with an LLM judge.
 
-> **Scope (v0.1):** agentfoo currently targets **[hermes-agent](#)** as the agent
+> **Scope (v0.1):** agentfoo currently targets **hermes-agent** as the agent
 > under test. The core (trace parsing, skill-invocation spies, the LLM judge,
 > retries) is agent-agnostic, but the only shipped adapter is `HermesAgent`.
 > Treat the API as pre-1.0 and subject to change.
