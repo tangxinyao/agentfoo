@@ -1,0 +1,27 @@
+{
+  "name": "agentfoo",
+  "version": "0.1.0",
+  "description": "A vitest-like unit test framework for skills and agents",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./config": "./src/config.ts"
+  },
+  "bin": {
+    "agentfoo": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "typecheck": "tsc --noEmit",
+    "example": "cd example && node ../src/cli.ts run"
+  },
+  "dependencies": {
+    "vitest": "^3.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
