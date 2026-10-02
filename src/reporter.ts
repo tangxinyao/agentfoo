@@ -1,6 +1,27 @@
 import { relative } from 'node:path'
-import { readAgentVersions, readJudgeArtifacts, readTriggerArtifacts, runDir, triggerStats, writeRunReport } from './artifacts.js'
+import {
+  readAgentVersions,
+  readJudgeArtifacts,
+  readRunForExport,
+  readTriggerArtifacts,
+  runDir,
+  triggerStats,
+  writeRunReport,
+} from './artifacts.js'
+import type {
+  DatasetGroups,
+  GroupStats,
+  RunReport,
+  TestReport,
+  TriggerStats,
+} from './artifacts.js'
+import { exportRun } from './otel.js'
 import type { JudgeRecord, TriggerRecord } from './types.js'
+
+// The report shape lives next to the writer/reader pair (artifacts.ts) so both
+// sides share one definition; re-exported here because this module is where the
+// shapes were originally published from.
+export type { DatasetGroups, GroupStats, TestReport } from './artifacts.js'
 
 /**
  * Artifact reporter (§9). Runs alongside vitest's default reporter; its only
@@ -26,54 +47,6 @@ interface Totals {
   skipped: number
   duration: number
 }
-
-/** One test as it appears in `report.json`. */
-export interface TestReport {
-  /** Spec file, relative to the cwd. */
-  file: string
-  /** Same shape as vitest's `currentTestName` ("describe > it"), the judge-record key. */
-  name: string
-  state: 'pass' | 'fail' | 'skip'
-  duration: number
-  /**
-   * The string-valued entries of vitest's `task.meta`, which a spec sets from
-   * inside the test (`task.meta.split = 'train'`) to tag a case for {@link DatasetGroups}.
-   */
-  meta: Record<string, string>
-  /** Every trigger assertion in this test: did the skill fire, and was it expected to. */
-  triggers: Array<{ skill: string; called: boolean; expected: boolean }>
-  /** Every `toSatisfy` grading in this test, in call order; full breakdowns stay in `judge-<n>.json`. */
-  judges: Array<{
-    index: number
-    model: string
-    target: JudgeRecord['target']
-    threshold: number
-    score: number
-    /** Number of judge samples averaged into `score`, and their standard deviation. */
-    samples: number
-    stdev: number
-    passed: boolean
-    unmet: string[]
-  }>
-}
-
-/** Pass/fail and mean scores for every test sharing one meta value. */
-export interface GroupStats {
-  total: number
-  passed: number
-  failed: number
-  skipped: number
-  /**
-   * Mean score of the i-th `toSatisfy` across the group's tests that reached it.
-   * Position is the only stable handle on "which grading": a suite that grades a
-   * hard gate first and quality second gets one column per layer. `null` where no
-   * test in the group got that far.
-   */
-  judgeMeans: Array<number | null>
-}
-
-/** meta key → meta value → stats, e.g. `groups.split.train`. */
-export type DatasetGroups = Record<string, Record<string, GroupStats>>
 
 function stringMeta(meta: object | undefined): Record<string, string> {
   const out: Record<string, string> = {}
@@ -194,7 +167,7 @@ function totalsOf(tests: TestReport[]): Totals {
 }
 
 class AgentfooReporter {
-  onFinished(files: TaskLike[] = []): void {
+  async onFinished(files: TaskLike[] = []): Promise<void> {
     const triggers = readTriggerArtifacts()
     const tests = buildTestReports(files, readJudgeArtifacts(), process.cwd(), triggers)
     const groups = groupTests(tests)
@@ -240,6 +213,24 @@ class AgentfooReporter {
       console.log(
         '     ⚠︎ ran in LOCAL runtime — results do NOT represent the CI/Docker environment (§3).',
       )
+    }
+
+    // OTLP export (§9 → otel.ts). Last, bounded, and never allowed to affect the
+    // suite: an output that can fail a test run is worse than no output. Silent
+    // unless something was actually emitted — a no-op without the optional
+    // `@opentelemetry/api` peer, and a no-op *with* it until a provider is
+    // registered, which is the consumer's (ours: the suite's setup file) job.
+    try {
+      const input = readRunForExport()
+      if (input) {
+        const outcome = exportRun(input)
+        if (outcome.spans > 0) {
+          // eslint-disable-next-line no-console
+          console.log(`       OTLP  ${outcome.spans} spans exported`)
+        }
+      }
+    } catch {
+      // Telemetry must never break a run.
     }
   }
 }

@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { takeOption } from './cli-args.js'
+import { exportRecordedRun } from './otel.js'
 import { latestRun, suggest } from './suggest.js'
 import { optimize } from './optimize.js'
 import { serveCompare, serveReview } from './review.js'
@@ -75,6 +76,21 @@ function main(): void {
         console.error(`agentfoo score: ${err.message}`)
         process.exit(1)
       })
+    return
+  }
+
+  // `agentfoo otel [--run <id>]` re-exports a *recorded* run as OTLP spans. The
+  // reporter already exports at the end of a run; this covers what that cannot:
+  // a deterministic flush (the reporter finishes while a batching provider may
+  // still hold spans) and backfilling every run already on disk — which is also
+  // how a dashboard can ingest history.
+  if (verb === 'otel') {
+    const { value: runFlag, args: afterRun } = takeOption(rest, ['--run'])
+    const positional = afterRun.find((a) => !a.startsWith('-'))
+    runOtelExport(runFlag ?? positional).catch((err: Error) => {
+      console.error(`agentfoo otel: ${err.message}`)
+      process.exit(1)
+    })
     return
   }
 
@@ -428,6 +444,51 @@ async function runReview(argv: string[]): Promise<void> {
   console.log(`\n  Reviewing run ${runId}`)
   console.log(`  Open ${url}  (bound to 127.0.0.1; on a remote host: ssh -L ${new URL(url).port}:127.0.0.1:${new URL(url).port} <host>)`)
   console.log(`  Saves to ${join(runPath, 'review.json')} as you go. Ctrl-C to stop.\n`)
+}
+
+/**
+ * Flush whatever provider the consumer's setup registered.
+ *
+ * `@opentelemetry/api` deliberately has no `forceFlush` — flushing is the SDK's
+ * job — so this relies on a convention our own setup file follows: a provider
+ * published as `globalThis.__AGENTFOO_OTEL_PROVIDER__`. When it is absent we say
+ * so instead of pretending: a batching provider's own shutdown hook still owns
+ * the flush, we just cannot await it from here.
+ */
+async function forceFlushProvider(): Promise<string> {
+  const provider = (
+    globalThis as { __AGENTFOO_OTEL_PROVIDER__?: { forceFlush?: () => Promise<void> } }
+  ).__AGENTFOO_OTEL_PROVIDER__
+  if (!provider?.forceFlush) return 'not exposed (nothing to await; its shutdown hook owns the flush)'
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error('timed out after 10s')), 10_000).unref()
+  })
+  try {
+    await Promise.race([provider.forceFlush(), timeout])
+    return 'flushed'
+  } catch (err) {
+    return `flush failed: ${(err as Error).message}`
+  }
+}
+
+/**
+ * `agentfoo otel [--run <id>]`: read a *recorded* run and emit its spans. The
+ * reading and export live in otel.ts (`exportRecordedRun`) so they can be tested
+ * without a CLI; this function only resolves the directory and prints.
+ */
+async function runOtelExport(runId?: string): Promise<void> {
+  const id = runId ?? latestRun()
+  if (!id) throw new Error('no runs found under .agentfoo/runs — pass --run <id>')
+  const dir = join(process.cwd(), '.agentfoo', 'runs', id)
+  if (!existsSync(dir)) throw new Error(`no such run: ${id}`)
+
+  const summary = exportRecordedRun(dir)
+  console.log(`\n  agentfoo otel  run ${summary.runId}  agent ${summary.agent ?? '(unset)'}`)
+  console.log(
+    `    tests ${summary.tests}   turns ${summary.turns}   spans ${summary.spans}` +
+      (summary.skipped ? `   skipped: ${summary.skipped}` : ''),
+  )
+  console.log(`    provider ${await forceFlushProvider()}`)
 }
 
 function latestCompare(): string | undefined {

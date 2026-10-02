@@ -37,9 +37,15 @@
     "prepublishOnly": "npm run build && npm run test && npm run typecheck"
   },
   "peerDependencies": {
+    "@opentelemetry/api": "^1.9.0",
     "vitest": "^3.2.7"
   },
   "devDependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0",
+    "@opentelemetry/sdk-trace-node": "^2.11.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0",
     "vitest": "^3.2.7"
