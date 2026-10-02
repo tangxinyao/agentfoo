@@ -1,14 +1,19 @@
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import { parseOpenAiChatTrace, parseOpencodePartTrace } from '../src/trace.js'
+import { buildTrace, parseOpencodePartTrace } from '../src/trace.js'
+import { fixture, fixtureTrace } from './fixture-trace.js'
 
-function fixture(name: string): string {
-  return readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)), 'utf8')
-}
-
-describe('parseOpenAiChatTrace', () => {
-  const trace = parseOpenAiChatTrace(fixture('frontend-design-triggered.jsonl'))
+/**
+ * Normalization, driven from a recorded capture.
+ *
+ * `buildTrace` is the layer every envelope ends up in: the OpenAI-shaped *message
+ * record* is agentfoo's internal IR, and both stream parsers reduce their events
+ * to it. So a recorded record-shaped capture is still the realistic input for
+ * these assertions even though the decoder that used to read that file format off
+ * disk (`parseOpenAiChatTrace`) is gone (TODO §P3) — {@link fixtureTrace} splits
+ * the lines and calls `buildTrace` directly, which is all that decoder did.
+ */
+describe('buildTrace normalization (recorded OpenAI-record capture)', () => {
+  const trace = fixtureTrace('frontend-design-triggered.jsonl')
 
   it('normalizes every role', () => {
     expect(trace.messages.map((m) => m.role)).toEqual([
@@ -42,42 +47,37 @@ describe('parseOpenAiChatTrace', () => {
 
   // hermes' native session export carries the model's thinking in `reasoning` /
   // `reasoning_content` (identical text). Preserved because for a preloaded skill
-  // it is the only evidence the skill fired (TODO §5).
+  // it is the only evidence the skill fired (TODO §5). The ACP parser feeds the
+  // same fields from `agent_thought_chunk`, so this stays load-bearing.
   it('preserves hermes reasoning / reasoning_content, keeping it out of the transcript', () => {
-    const t = parseOpenAiChatTrace(
-      JSON.stringify({
+    const t = buildTrace([
+      {
         role: 'assistant',
         content: 'Here is the page.',
         reasoning: 'Let me load the frontend-design skill first.',
         reasoning_content: 'Let me load the frontend-design skill first.',
-      }),
-    )
+      },
+    ])
     expect(t.messages[0].reasoning).toBe('Let me load the frontend-design skill first.')
     expect(t.messages[0].content).toBe('Here is the page.')
     expect(t.text()).not.toContain('frontend-design')
   })
 
   it('falls back to reasoning_content when reasoning is null or blank', () => {
-    const t = parseOpenAiChatTrace(
-      JSON.stringify({
+    const t = buildTrace([
+      {
         role: 'assistant',
         content: 'ok',
         reasoning: null,
         reasoning_content: 'the real thinking',
-      }),
-    )
+      },
+    ])
     expect(t.messages[0].reasoning).toBe('the real thinking')
   })
 
   it('leaves reasoning undefined when the agent exports none', () => {
-    const t = parseOpenAiChatTrace(JSON.stringify({ role: 'assistant', content: 'ok' }))
+    const t = buildTrace([{ role: 'assistant', content: 'ok' }])
     expect(t.messages[0].reasoning).toBeUndefined()
-  })
-
-  it('tolerates blank lines and non-JSON banner noise', () => {
-    const noisy = 'loongsuite bootstrap started\n\n' + fixture('unrelated.jsonl')
-    const t = parseOpenAiChatTrace(noisy)
-    expect(t.messages.length).toBe(5)
   })
 })
 
@@ -89,10 +89,7 @@ describe('parseOpenAiChatTrace', () => {
  * from a run that had actually succeeded.
  */
 describe('parseOpencodePartTrace against a real 1.18.5 capture', () => {
-  const capture = readFileSync(
-    fileURLToPath(new URL('./fixtures/opencode-run.jsonl', import.meta.url)),
-    'utf8',
-  )
+  const capture = fixture('opencode-run.jsonl')
 
   it('recovers the assistant turns and every tool call', () => {
     const trace = parseOpencodePartTrace(capture)

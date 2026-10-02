@@ -1,50 +1,34 @@
-import type { ToolCall, Trace, TraceMessage, TraceRole } from './types.js'
+import type { AvailableCommand, ToolCall, Trace, TraceMessage, TraceRole } from './types.js'
 
 /**
- * Trace parsers, one per **wire envelope** — not one per agent. Four built-in
- * agents map onto three envelopes (hermes/pi/openclaw all speak ACP through
- * acpx), and a bring-your-own CLI may reuse any of them, so these are named
- * after the format they decode:
+ * Trace parsers, one per **wire envelope** — not one per agent. Three built-in
+ * agents speak ACP through acpx (hermes/pi/openclaw) and opencode has its own
+ * part stream, so these are named after the format they decode:
  *
- * | parser                    | envelope                            | agents            |
- * |---------------------------|-------------------------------------|-------------------|
- * | {@link parseOpenAiChatTrace}  | OpenAI chat jsonl, one msg/record   | BYO default (§7)  |
- * | {@link parseOpencodePartTrace}| opencode `run --format json` parts  | opencode          |
+ * | parser                        | envelope                            | agents               |
+ * |-------------------------------|-------------------------------------|----------------------|
+ * | {@link parseOpencodePartTrace}| opencode `run --format json` parts  | opencode             |
  * | {@link parseAcpTrace}         | ACP JSON-RPC `session/update` stream| hermes, pi, openclaw |
  *
- * They are deliberately NOT one auto-sniffing `parseTrace`: the three are
- * different protocols (records with `role` / flat part events with no role /
- * JSON-RPC notifications that split a tool call from its result), and every
- * added sniffing branch is another way to mis-detect and silently produce an
- * empty trace — the §IX.1 failure mode. What they DO share is the streaming
- * shape, and that is factored out into {@link reduceEventStream} below: each
- * stream parser is just an envelope→{@link StreamEvent} mapper.
- */
-
-/**
- * Build a normalized {@link Trace} from OpenAI-shaped chat jsonl — one record per
- * message, each carrying its own `role`. This is the default parser for a custom
- * {@link file://./agent/command.ts CommandAgentDef} and the shape hermes' native
- * `sessions export --format jsonl` emits (hermes itself now runs over ACP, see
- * {@link parseAcpTrace}).
+ * A third decoder — for OpenAI-shaped chat jsonl — was removed (2026-10-02,
+ * TODO §P3) and its `parseTrace` alias with it. It had been the default for a
+ * bring-your-own CLI, but no shipped agent produced that envelope any more and
+ * it had **never been checked against a real CLI**: an unverified *default* is
+ * worse than no default, because it silently feeds a possibly-misread trace to
+ * the judge. A BYO agent that speaks ACP registers through
+ * {@link file://./agent/acpx.ts acpxSpecFactory} (a first-class path); anything
+ * else supplies its own `parse`, which is now required.
  *
- * Deliberately tolerant of the variants an OpenAI-SDK-based CLI might produce:
- * content blocks vs plain strings, `tool_calls` vs legacy `function_call`, and
- * records optionally wrapped in `{message: …}` / `{messages: […]}`.
+ * The two are deliberately NOT one auto-sniffing `parseTrace`: they are
+ * different protocols (flat part events with no role vs JSON-RPC notifications
+ * that split a tool call from its result), and every added sniffing branch is
+ * another way to mis-detect and silently produce an empty trace — the §IX.1
+ * failure mode. What they DO share is the streaming shape, factored out into
+ * {@link reduceEventStream} below: each parser is just an envelope→{@link StreamEvent}
+ * mapper, and both reduce to an OpenAI-shaped *message record* — which stays the
+ * internal IR that {@link buildTrace} normalizes, so the record shape outlived
+ * the decoder that used to read it off disk.
  */
-export function parseOpenAiChatTrace(jsonl: string): Trace {
-  const raw: unknown[] = []
-  for (const line of jsonl.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-    try {
-      raw.push(JSON.parse(trimmed))
-    } catch {
-      // Skip non-JSON banner lines (hermes prints an OTEL bootstrap notice).
-    }
-  }
-  return buildTrace(raw)
-}
 
 // ---------------------------------------------------------------------------
 // Shared streaming layer
@@ -71,6 +55,15 @@ type StreamEvent =
   | { type: 'tool-args'; id?: string; arguments: Record<string, unknown> }
   | { type: 'tool-result'; id?: string; content: unknown }
   | { type: 'turn-end' }
+  /**
+   * The agent's advertised slash/skill command list (ACP `available_commands_update`,
+   * TODO §P1 — needed for forced-mode probing: it answers whether a given agent
+   * exposes per-skill slash commands over ACP at all, rather than guessing).
+   * Previously dropped as noise; a real hermes capture shows only generic
+   * gateway commands (`help`, `model`, `bash`, …), no per-skill entries — itself
+   * useful evidence, not just plumbing.
+   */
+  | { type: 'available-commands'; commands: AvailableCommand[] }
 
 /**
  * Map one raw stream record to normalized events.
@@ -96,12 +89,15 @@ type StreamMapper = (record: Record<string, unknown>) => StreamEvent[] | null
 function reduceEventStream(
   records: unknown[],
   map: StreamMapper,
-): { synth: unknown[]; recognized: number } {
+): { synth: unknown[]; recognized: number; availableCommands?: AvailableCommand[] } {
   const synth: unknown[] = []
   let recognized = 0
   let text = ''
   let reasoning = ''
   let toolCalls: unknown[] = []
+  // Last-wins: an agent that re-advertises its command list mid-stream should
+  // report its current set, not its first.
+  let availableCommands: AvailableCommand[] | undefined
   // Argument objects of already-emitted calls, by id, so a `tool-args` event can
   // merge into one after its message was flushed. Safe because these objects are
   // pushed by reference and only read once the whole stream has been reduced.
@@ -158,12 +154,15 @@ function reduceEventStream(
         case 'turn-end':
           flush()
           break
+        case 'available-commands':
+          availableCommands = ev.commands
+          break
       }
     }
   }
 
   flush()
-  return { synth, recognized }
+  return { synth, recognized, availableCommands }
 }
 
 /**
@@ -181,8 +180,8 @@ function reduceEventStream(
  */
 function parseEventStream(text: string, map: StreamMapper, envelope: string): Trace {
   const records = parseJsonStream(text)
-  const { synth, recognized } = reduceEventStream(records, map)
-  if (recognized > 0) return buildTraceFrom(synth, records)
+  const { synth, recognized, availableCommands } = reduceEventStream(records, map)
+  if (recognized > 0) return buildTraceFrom(synth, records, availableCommands)
 
   const fallback = buildTrace(records)
   if (fallback.messages.length > 0 || records.length === 0) return fallback
@@ -332,12 +331,19 @@ const acpMapper: StreamMapper = (rec) => {
       }
       return events
     }
+    case 'available_commands_update': {
+      const commands = update.availableCommands
+      if (!Array.isArray(commands)) return []
+      return [{ type: 'available-commands', commands: commands.filter(isAvailableCommand) }]
+    }
     default:
-      // available_commands_update, usage_update: ignored. (The former advertises
-      // the agent's slash/skill commands — capture it when forced skill
-      // invocation lands, TODO §8.)
+      // usage_update and anything else: genuinely no conversational content.
       return []
   }
+}
+
+function isAvailableCommand(v: unknown): v is AvailableCommand {
+  return !!v && typeof v === 'object' && typeof (v as { name?: unknown }).name === 'string'
 }
 
 /** Parse an acpx `--format json` (ACP NDJSON) stream into a normalized {@link Trace}. */
@@ -422,8 +428,6 @@ function partialInputToolCallId(line: string): string | undefined {
 // Deprecated aliases (pre-0.2 names)
 // ---------------------------------------------------------------------------
 
-/** @deprecated Renamed to {@link parseOpenAiChatTrace} — it decodes a format, not "the" trace. */
-export const parseTrace = parseOpenAiChatTrace
 /** @deprecated Renamed to {@link parseOpencodePartTrace}. */
 export const parseOpencodeTrace = parseOpencodePartTrace
 /** @deprecated Renamed to {@link parseAcpTrace} — acpx is the launcher, ACP is the protocol. */
@@ -509,7 +513,11 @@ export function buildTrace(raw: unknown[]): Trace {
  * but `trace.raw` must stay the CLI's own records so the escape hatch can reach
  * anything this layer drops.
  */
-function buildTraceFrom(records: unknown[], raw: unknown[]): Trace {
+function buildTraceFrom(
+  records: unknown[],
+  raw: unknown[],
+  availableCommands?: AvailableCommand[],
+): Trace {
   const expanded = records.flatMap(expandRecord)
   const messages: TraceMessage[] = []
   for (const rec of expanded) {
@@ -536,6 +544,7 @@ function buildTraceFrom(records: unknown[], raw: unknown[]): Trace {
     toolCalls,
     finalMessage,
     raw,
+    availableCommands,
     text: () => renderTranscript(messages),
   }
 }

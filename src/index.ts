@@ -56,16 +56,17 @@ export {
   skillFileReadDetector,
 } from './skill.js'
 // Trace parsers are named after the wire envelope they decode, not after an
-// agent: four built-in agents map onto three envelopes (hermes/pi/openclaw all
-// speak ACP), and a bring-your-own CLI may reuse any of them.
+// agent: three built-in agents speak ACP through acpx, opencode has its own part
+// stream. There is deliberately no default decoder for a bring-your-own CLI —
+// a wire shape cannot be guessed, and guessing it wrong yields an empty trace
+// (TODO §IX.1) — so `registerCommandAgent` requires an explicit `parse`, and an
+// ACP-speaking BYO agent registers through acpxSpecFactory instead.
 export {
-  parseOpenAiChatTrace,
   parseOpencodePartTrace,
   parseAcpTrace,
   compactAcpStream,
   buildTrace,
   // Deprecated pre-0.2 aliases.
-  parseTrace,
   parseOpencodeTrace,
   parseAcpxTrace,
 } from './trace.js'

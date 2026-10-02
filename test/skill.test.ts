@@ -1,7 +1,7 @@
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { afterEach, describe, it, expect } from 'vitest'
-import { parseOpenAiChatTrace } from '../src/trace.js'
+// The captures below are OpenAI-record shaped, which is agentfoo's internal IR
+// (see fixture-trace.ts); aliased so the call sites keep reading as "a trace".
+import { fixtureTrace as trace } from './fixture-trace.js'
 import {
   SkillHandle,
   detectSkillInvocations,
@@ -19,14 +19,6 @@ function reasoningTrace(reasoning: string): Trace {
     raw: [],
     text: () => '',
   }
-}
-
-function trace(name: string) {
-  const jsonl = readFileSync(
-    fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)),
-    'utf8',
-  )
-  return parseOpenAiChatTrace(jsonl)
 }
 
 describe('detectSkillInvocations (§11 heuristic)', () => {

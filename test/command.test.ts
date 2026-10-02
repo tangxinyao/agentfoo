@@ -40,16 +40,26 @@ function boot(def: CommandAgentDef, env: RuntimeEnv, config: AgentBootOptions['c
   return new CommandAgent(def, { env, config, sourceTag: 'agentfoo-test' })
 }
 
+/**
+ * `parse` is required (TODO §IX.1/§P3): there is no default decoder, because a
+ * wrong guess at a CLI's wire envelope yields an empty trace that then fails an
+ * unrelated assertion. Most of these tests are about argv, session handling and
+ * plumbing rather than decoding, so they share one trivial decoder; the two that
+ * do care about parsing name their own.
+ */
+const nothingParsed = () => buildTrace([])
+
 describe('CommandAgent', () => {
   it('builds argv from the definition, forwarding the resolved bare model', async () => {
     const env = fakeEnv(() => ({
-      stdout: '{"messages":[{"role":"assistant","content":"hi there"}]}',
+      stdout: '{"role":"assistant","content":"hi there"}',
       stderr: '',
       exitCode: 0,
     }))
     const agent = boot(
       {
         run: ({ prompt, model }) => ['mycli', 'chat', prompt, ...(model ? ['-m', model] : [])],
+        parse: (out) => buildTrace([JSON.parse(out) as unknown]),
       },
       env,
       { model: 'deepseek/deepseek-v4' },
@@ -59,7 +69,6 @@ describe('CommandAgent', () => {
 
     // provider prefix stripped for the bare `-m` value, like the built-in adapters
     expect(env.calls[0]).toEqual(['mycli', 'chat', 'hello', '-m', 'deepseek-v4'])
-    // default parser is parseOpenAiChatTrace → OpenAI-shaped jsonl
     expect(trace.finalMessage).toBe('hi there')
     expect(agent.traces).toHaveLength(1)
   })
@@ -70,6 +79,7 @@ describe('CommandAgent', () => {
       {
         run: ({ prompt, sessionId }) => ['x', prompt, ...(sessionId ? ['--resume', sessionId] : [])],
         extractSessionId: (out) => out.match(/session:\s*(\S+)/)?.[1],
+        parse: nothingParsed,
       },
       env,
     )
@@ -95,9 +105,18 @@ describe('CommandAgent', () => {
     expect(trace.finalMessage).toBe('parsed by me')
   })
 
+  it('refuses to boot a definition that names no parser', () => {
+    const env = fakeEnv(() => ({ stdout: '', stderr: '', exitCode: 0 }))
+    // The type requires `parse`; a JS consumer or a caller compiled against the
+    // old default would still reach here, and used to fail deep inside a run
+    // with "this.def.parse is not a function".
+    const def = { run: () => ['x'] } as unknown as CommandAgentDef
+    expect(() => boot(def, env)).toThrow(/`parse` is required/)
+  })
+
   it('throws with stderr when the CLI exits non-zero', async () => {
     const env = fakeEnv(() => ({ stdout: '', stderr: 'boom', exitCode: 3 }))
-    const agent = boot({ run: () => ['x'] }, env)
+    const agent = boot({ run: () => ['x'], parse: nothingParsed }, env)
     await expect(agent.run('go')).rejects.toThrow(/x exited 3\nboom/)
   })
 
@@ -107,6 +126,7 @@ describe('CommandAgent', () => {
     const agent = boot(
       {
         run: () => ['x'],
+        parse: nothingParsed,
         init: ({ model, provider }) => {
           seen = { model, provider }
         },
@@ -121,7 +141,7 @@ describe('CommandAgent', () => {
 
 describe('registerCommandAgent', () => {
   it('registers a resolvable spec with sensible home/dockerfile defaults', () => {
-    registerCommandAgent('cmd-default', { run: () => ['x'] })
+    registerCommandAgent('cmd-default', { run: () => ['x'], parse: nothingParsed })
     const spec = agentSpec('cmd-default')
     expect(spec.homeEnvVar).toBe('AGENT_HOME')
     // absent from the package on purpose → surfaces the actionable docker error
@@ -129,7 +149,11 @@ describe('registerCommandAgent', () => {
   })
 
   it('honours an explicit homeEnvVar', () => {
-    registerCommandAgent('cmd-custom', { run: () => ['x'], homeEnvVar: 'CMD_HOME' })
+    registerCommandAgent('cmd-custom', {
+      run: () => ['x'],
+      parse: nothingParsed,
+      homeEnvVar: 'CMD_HOME',
+    })
     expect(agentSpec('cmd-custom').homeEnvVar).toBe('CMD_HOME')
   })
 })
