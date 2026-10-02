@@ -1,0 +1,5 @@
+{"role":"system","content":"You are Hermes, a helpful coding agent."}
+{"role":"user","content":"帮我为一个精品手冲咖啡品牌做一个产品落地页的视觉设计"}
+{"role":"assistant","content":"Let me consult the frontend-design skill first.","tool_calls":[{"id":"call_1","function":{"name":"skill_view","arguments":"{\"name\":\"frontend-design\"}"}}]}
+{"role":"tool","tool_call_id":"call_1","name":"skill_view","content":"# Frontend Design\nApproach this as the design lead at a small studio..."}
+{"role":"assistant","content":"这是落地页方案：Hero 用一杯正在滴滤的手冲特写，配深烘焙棕与米白的克制配色，展示字体用一款有个性的衬线体搭配无衬线正文，并保证键盘焦点与减少动效的可访问性支持。"}

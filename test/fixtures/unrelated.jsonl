@@ -1,0 +1,5 @@
+{"role":"system","content":"You are Hermes, a helpful coding agent."}
+{"role":"user","content":"今天北京的天气怎么样？"}
+{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"bash","arguments":"{\"cmd\":\"curl -s wttr.in/Beijing?format=3\"}"}}]}
+{"role":"tool","tool_call_id":"c1","name":"bash","content":"Beijing: ☀️ +25°C"}
+{"role":"assistant","content":"北京今天晴，气温约 25°C。"}

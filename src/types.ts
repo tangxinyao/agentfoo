@@ -1,0 +1,173 @@
+/**
+ * Public type surface for agentfoo.
+ *
+ * These types are intentionally small and stable: §2 of the design doc treats
+ * the vitest foundation as a revisitable bet, so the interface layer must not
+ * leak vitest internals to test authors.
+ */
+
+export type Runtime = 'docker' | 'local'
+
+/** Which kind of target is under test. Today only hermes-agent (§7). */
+export type AgentKind = 'hermes'
+
+/** Resolved configuration for a single agent instance. */
+export interface AgentConfig {
+  /**
+   * Model id, optionally provider-prefixed like the judge (`anthropic/claude-sonnet-5`
+   * or a bare `claude-sonnet-5`). A prefix populates `provider` when it isn't set
+   * explicitly; an explicit `provider` always wins and the prefix is stripped.
+   */
+  model?: string
+  /** Inference provider passed to the agent CLI (hermes `--provider`). Overrides any `model` prefix. */
+  provider?: string
+  /**
+   * Base URL for the provider's OpenAI-compatible endpoint, written into the
+   * container's hermes `config.yaml` (`model.base_url`). Needed for providers
+   * hermes doesn't have a built-in default for (e.g. deepseek).
+   */
+  baseUrl?: string
+  /** docker (default, CI-safe) or local (dev escape hatch, §3). */
+  runtime?: Runtime
+  /**
+   * Prebuilt docker image carrying the hermes binary. One of `image` or
+   * `dockerfile` is required for `runtime: 'docker'`.
+   */
+  image?: string
+  /**
+   * Path to a Dockerfile to build the test image from (relative to the config
+   * file / cwd). agentfoo builds it once, tags it by content hash, and reuses
+   * the tag across runs. Takes precedence over `image` when both are set.
+   */
+  dockerfile?: string
+  /** Build context dir for `dockerfile`. Defaults to the Dockerfile's dir. */
+  buildContext?: string
+  /**
+   * Names of host environment variables to forward into the runtime on every
+   * command (provider API keys / credentials, e.g. `['DEEPSEEK_API_KEY']`).
+   * Values are read from the host `process.env` at run time so secrets never
+   * live in the config file or the image.
+   */
+  passEnv?: string[]
+  /**
+   * Disable the agent's self-learning / memory so repeated runs stay
+   * reproducible (§7). Defaults to true; only turn off when the test target
+   * *is* the self-evolution behaviour.
+   */
+  memory?: boolean
+  /** Extra raw CLI flags appended verbatim. Escape hatch, use sparingly. */
+  extraArgs?: string[]
+}
+
+/** A single tool invocation as recorded in the agent trace. */
+export interface ToolCall {
+  /** Function/tool name, e.g. `bash`, `edit_file`, `skill_view`. */
+  name: string
+  /** Parsed arguments object (best-effort; raw string kept in `rawArguments`). */
+  arguments: Record<string, unknown>
+  rawArguments?: string
+  /** Correlates a call with its result message, when the agent provides ids. */
+  id?: string
+  /** Tool result / observation text, when resolvable. */
+  result?: string
+}
+
+export type TraceRole = 'system' | 'user' | 'assistant' | 'tool'
+
+export interface TraceMessage {
+  role: TraceRole
+  content: string
+  toolCalls?: ToolCall[]
+  /** For role === 'tool': which call this responds to. */
+  toolCallId?: string
+  toolName?: string
+}
+
+/**
+ * Normalized conversation trace. Built directly from hermes' session export
+ * (§7 / §10 — we deliberately do not invent a new schema).
+ */
+export interface Trace {
+  messages: TraceMessage[]
+  /** Flattened tool calls across all assistant turns, in order. */
+  toolCalls: ToolCall[]
+  /** Last assistant text message. */
+  finalMessage: string
+  /** Original parsed jsonl records, untouched, for escape-hatch inspection. */
+  raw: unknown[]
+  /** Full rendered transcript, used as the default target for `toSatisfy`. */
+  text(): string
+}
+
+/** A single weighted rubric criterion for LLM-judge assertions (§5). */
+export interface RubricCriterion {
+  criteria: string
+  weight?: number
+}
+
+export type Rubric = string | RubricCriterion[]
+
+export interface SatisfyOptions {
+  /** Pass threshold in [0,1] for weighted rubrics. Default 1 for single. */
+  threshold?: number
+  /** Override judge model for this single call (syntactic sugar, §6). */
+  model?: string
+}
+
+/** Pass-decision strategy for {@link retry} (§5). */
+export type RetryPolicy = 'any' | 'majority'
+
+export interface RetryOptions {
+  /**
+   * Total attempts (not extra retries). Defaults to the config `retries` value
+   * + 1, so `retries: 0` → a single attempt (retry off).
+   */
+  attempts?: number
+  /** 'any' (default): pass if any attempt succeeds. 'majority': strict majority. */
+  policy?: RetryPolicy
+}
+
+export interface JudgeResult {
+  passed: boolean
+  score: number
+  threshold: number
+  /** Per-criterion breakdown for artifact/debugging output. */
+  breakdown: Array<{ criteria: string; weight: number; met: boolean; reason: string }>
+}
+
+export interface JudgeConfig {
+  /** Provider-prefixed model string, e.g. `anthropic/claude-opus-4-8`, `deepseek/deepseek-chat`. */
+  model: string
+  /**
+   * Explicit provider override. Normally derived from the `model` prefix; set
+   * this only to point a bare (un-prefixed) model at a known provider, or to
+   * reuse a provider's request/response shape against a custom `baseUrl`.
+   */
+  provider?: string
+  /**
+   * Override the provider's default API endpoint (e.g. an OpenAI-compatible
+   * gateway or a self-hosted proxy). Uses the resolved provider's request shape.
+   */
+  baseUrl?: string
+  /**
+   * Override which host env var holds the API key. Defaults to the provider's
+   * conventional variable (`ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, …).
+   */
+  apiKeyEnv?: string
+}
+
+export interface AgentfooConfig {
+  judge?: Partial<JudgeConfig>
+  agents?: Record<string, AgentConfig>
+  /** Retry a failing test N times (§5). Default 0 (off). */
+  retries?: number
+  /**
+   * Per-test / per-hook timeout in ms. A single agent turn is a full LLM
+   * round-trip (optionally + a container boot), so this is deliberately large.
+   * Default 300_000 (5 min).
+   */
+  timeout?: number
+  /** vitest passthrough. */
+  setupFiles?: string[]
+  include?: string[]
+}
