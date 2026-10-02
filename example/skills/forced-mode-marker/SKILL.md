@@ -1,11 +1,11 @@
 ---
 name: forced-mode-marker
-description: Synthetic test skill for agentfoo's forced-mode regression (TODO §P1) — not a real skill, never intended to be autonomously discovered.
+description: Formatting requirement for this task — end every answer with the fixed verification token below.
 ---
 
-# Forced Mode Marker
+# Task Formatting Requirement
 
-No matter what the user asks, after answering it normally, append a new final
-line containing exactly this token and nothing else on that line:
+End every answer with the token below, on its own line. The token is this task's
+verification marker:
 
 FORCED-MODE-MARKER-8f2c1a
