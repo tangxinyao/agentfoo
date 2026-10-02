@@ -1,5 +1,6 @@
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
+import type { TurnRecord } from '../steps.js'
 import type { SkillHandle } from '../skill.js'
 
 /**
@@ -45,6 +46,33 @@ export interface Agent {
 }
 
 /**
+ * What one finished turn hands the fixture layer for archiving (§9).
+ *
+ * `trace` is absent when the turn produced no parseable envelope. A non-zero
+ * exit or a killed turn still archives its raw stream, its per-step timing and
+ * the reason it failed: that is the turn whose evidence matters most, and by the
+ * time the adapter throws, the test that asked for it may already be gone (its
+ * timeout fires while this promise is still pending, and vitest drops the late
+ * rejection) — so the archive is the only surviving record.
+ */
+export interface TurnArtifacts {
+  trace?: Trace
+  sessionJsonl: string
+  /**
+   * The test this turn belongs to, snapshotted when `run()` *started*. Adapters
+   * must not re-resolve it at archive time: after a test timeout vitest has
+   * already moved the global current-test name on to the next test, which is how
+   * one 974s turn's trace, trigger record and judge all landed under the
+   * following test and turned that test's negative assertion into a false red.
+   */
+  testName?: string
+  /** Per-step arrival timeline (see {@link file://../steps.ts StepRecorder}). */
+  timeline?: TurnRecord
+  /** Present when the turn ended in a timeout or a non-zero exit. */
+  failure?: { exitCode: number; timedOut?: boolean }
+}
+
+/**
  * Everything an adapter needs to boot. Shared across adapters so the fixture
  * layer constructs any agent kind the same way (via the registry).
  */
@@ -54,11 +82,20 @@ export interface AgentBootOptions {
   /** Unique tag so a session lookup can find this instance's sessions. */
   sourceTag: string
   /**
-   * Called after every `run()` with the turn's trace and the raw session export.
+   * Called after every `run()` — success or failure — with the turn's artifacts.
    * Used by the fixture layer to drop per-test artifacts (§9) without coupling
    * an adapter to vitest or the filesystem layout.
    */
-  onTrace?: (info: { trace: Trace; sessionJsonl: string }) => void
+  onTrace?: (info: TurnArtifacts) => void
+  /**
+   * Outer bound on one turn, derived by the fixture layer from the suite's
+   * `timeout` minus a margin. Adapters use it as the default per-turn exec
+   * timeout so a runaway turn is killed *inside* its own test: a turn that
+   * outlives its test otherwise keeps running (polluting the next test's
+   * artifacts and spy window) and burns tens of minutes of real spend doing it.
+   * An explicit `run(prompt, { timeout })` still wins.
+   */
+  turnTimeoutMs?: number
   /**
    * Identifies the currently executing test. When it changes between `run()`s,
    * the session is reset so each test starts a fresh conversation. Injected by

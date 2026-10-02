@@ -2,12 +2,12 @@ import { join } from 'node:path'
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
 import type { Agent, AgentBootOptions, RunOptions } from './types.js'
-import { parseOpenAiChatTrace } from '../trace.js'
 import { resolveModelProvider } from './hermes.js'
 import { SkillHandle } from '../skill.js'
 import type { SkillDetector } from '../skill.js'
-import { preview, progress, withHeartbeat } from '../progress.js'
-import { collectCredentials, readSkillName, turnTimedOut } from './shared.js'
+import { preview } from '../progress.js'
+import { collectCredentials, readSkillName } from './shared.js'
+import { execTurn, finishTurn } from './turn.js'
 import { registerAgent } from './registry.js'
 
 /**
@@ -70,11 +70,15 @@ export interface CommandAgentDef {
   /** Build the argv for one conversation turn. The only required hook. */
   run(ctx: CommandRunContext): string[]
   /**
-   * Parse the run's stdout into a normalized {@link Trace}. Defaults to
-   * {@link parseOpenAiChatTrace} (OpenAI-shaped jsonl); pass {@link parseOpencodePartTrace} /
-   * {@link parseAcpTrace} or your own for a different envelope.
+   * Parse the run's stdout — or {@link exportTrace}'s output — into a normalized
+   * {@link Trace}. **Required**, because which wire envelope a CLI prints is the
+   * one thing agentfoo cannot guess: a wrong guess yields an empty trace that
+   * then fails an unrelated assertion (TODO §IX.1), and the decoder that used to
+   * be the default here was removed for exactly that reason (TODO §P3). Use a
+   * shipped decoder — {@link parseAcpTrace} for anything that speaks ACP,
+   * {@link parseOpencodePartTrace} for opencode's part stream — or your own.
    */
-  parse?(stdout: string): Trace
+  parse(stdout: string): Trace
   /** Optional setup before the first run — e.g. write a config file into the home. */
   init?(ctx: CommandInitContext): void | Promise<void>
   /** Optional: capture a session id from stdout so later turns can continue it. */
@@ -111,6 +115,8 @@ export class CommandAgent implements Agent {
   private readonly sourceTag: string
   private readonly onTrace?: AgentBootOptions['onTrace']
   private readonly currentTest?: () => string | undefined
+  /** Adapter-enforced per-turn bound (see {@link AgentBootOptions.turnTimeoutMs}). */
+  private readonly turnTimeoutMs?: number
   private readonly credentialEnv: Record<string, string>
 
   private sessionId: string | undefined
@@ -124,11 +130,25 @@ export class CommandAgent implements Agent {
     private readonly def: CommandAgentDef,
     opts: AgentBootOptions,
   ) {
+    // Fail at boot with something actionable. The type already requires `parse`,
+    // but a JS consumer (or a stale compiled caller) would otherwise hit
+    // "this.def.parse is not a function" from inside a run, which reads as a
+    // framework bug rather than a missing declaration.
+    if (typeof def.parse !== 'function') {
+      throw new Error(
+        'registerCommandAgent: `parse` is required (TODO §IX.1/§P3) — agentfoo cannot guess ' +
+          "which wire envelope a CLI prints, and guessing wrong produced an empty trace that then " +
+          'failed an unrelated assertion. Pass parseAcpTrace for an ACP-speaking agent, ' +
+          "parseOpencodePartTrace for opencode's part stream, or your own decoder. An ACP-speaking " +
+          'agent can skip this adapter entirely and register through acpxSpecFactory.',
+      )
+    }
     this.env = opts.env
     this.config = opts.config
     this.sourceTag = opts.sourceTag
     this.onTrace = opts.onTrace
     this.currentTest = opts.currentTest
+    this.turnTimeoutMs = opts.turnTimeoutMs
     this.credentialEnv = collectCredentials(opts.config.passEnv)
   }
 
@@ -181,6 +201,11 @@ export class CommandAgent implements Agent {
       this.reset()
       this.sessionTest = test
     }
+    // Snapshotted for artifact filing: after a test timeout vitest has already
+    // moved the global current-test name on to the next test (TODO §timeout,
+    // see AcpxAgent.run for the failure this caused).
+    const turnTest = test
+    const timeoutMs = opts.timeout ?? this.turnTimeoutMs
     const { model, provider } = resolveModelProvider(this.config)
     const argv = this.def.run({
       prompt,
@@ -194,31 +219,52 @@ export class CommandAgent implements Agent {
       agentHome: this.env.agentHome,
       skillsPath: this.env.skillsPath,
     })
-    const { stdout, stderr, exitCode, timedOut } = await withHeartbeat(
-      `${argv[0] ?? 'command'} run: "${preview(prompt)}"`,
-      () => this.env.exec(argv, { env: this.credentialEnv, timeoutMs: opts.timeout }),
-    )
-    if (timedOut) throw turnTimedOut(argv[0] ?? 'command', prompt, opts.timeout!, stderr || stdout)
-    if (exitCode !== 0) {
-      throw new Error(`${argv[0] ?? 'command'} exited ${exitCode}\n${stderr || stdout}`)
-    }
+    // A BYO CLI's envelope is opaque to us: unless its `parse` gives us bracketed
+    // tool frames (none does today), model and tool time share windows, so the
+    // split is labeled coarse rather than claiming precision it cannot have.
+    const outcome = await execTurn({
+      label: `${argv[0] ?? 'command'} run: "${preview(prompt)}"`,
+      argv,
+      env: this.env,
+      execEnv: this.credentialEnv,
+      timeoutMs,
+      splitQuality: 'coarse',
+    })
 
-    this.sessionId = this.def.extractSessionId?.(stdout) ?? this.sessionId
-    this.started = true
-
-    const jsonl = this.def.exportTrace
-      ? await this.def.exportTrace({
+    // Some CLIs keep the trace out of stdout and export the saved session
+    // separately. Skipped when it can only fail (a non-zero exit has no session to
+    // export), and a *failing* export is deferred rather than thrown here: it must
+    // not cost us the archive that explains the turn (TODO §timeout).
+    let deferredError: Error | undefined
+    if (outcome.result.exitCode === 0 && !outcome.result.timedOut && this.def.exportTrace) {
+      try {
+        outcome.stream = await this.def.exportTrace({
           env: this.env,
           sessionId: this.sessionId,
-          stdout,
+          stdout: outcome.result.stdout,
           sourceTag: this.sourceTag,
           credentialEnv: this.credentialEnv,
         })
-      : stdout
-    const trace = (this.def.parse ?? parseOpenAiChatTrace)(jsonl)
-    progress(`  trace: ${trace.messages.length} messages, ${trace.toolCalls.length} tool calls`)
-    this.traces.push(trace)
-    this.onTrace?.({ trace, sessionJsonl: jsonl })
+      } catch (err) {
+        deferredError = err as Error
+      }
+    }
+
+    const trace = await finishTurn(outcome, {
+      label: argv[0] ?? 'command',
+      prompt,
+      timeoutMs,
+      parse: this.def.parse,
+      archive: (artifacts) =>
+        this.onTrace?.({ ...artifacts, ...(turnTest !== undefined ? { testName: turnTest } : {}) }),
+      remember: (t) => this.traces.push(t),
+      exitMessage: (r) => `${argv[0] ?? 'command'} exited ${r.exitCode}\n${r.stderr || r.stdout}`,
+      ...(deferredError ? { deferredError } : {}),
+      onBadTurn: () => this.reset(),
+    })
+
+    this.sessionId = this.def.extractSessionId?.(outcome.result.stdout) ?? this.sessionId
+    this.started = true
     return trace
   }
 
@@ -269,7 +315,11 @@ export interface CommandAgentRegistration extends CommandAgentDef {
  *     ...(sessionId ? ['--resume', sessionId] : []),
  *   ],
  *   extractSessionId: (out) => out.match(/session:\s*(\S+)/)?.[1],
- *   // parse defaults to parseOpenAiChatTrace (OpenAI-shaped jsonl)
+ *   // Required: name the wire envelope this CLI prints. There is no default —
+ *   // guessing one wrong produced an empty trace that then failed an unrelated
+ *   // assertion (TODO §IX.1). An ACP-speaking CLI can skip this adapter entirely
+ *   // and register through `acpxSpecFactory`.
+ *   parse: parseAcpTrace,
  * })
  * ```
  *

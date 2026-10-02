@@ -87,7 +87,12 @@ ENV HERMES_HOME=/opt/hermes-home
 #   --no-skills       blank slate; agentfoo copies skills in at test time
 #   --non-interactive never block on a prompt
 #   --branch          pin to HERMES_REF (tag)
-RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
+# The installer script is fetched from that SAME tag, not from main. The main
+# branch has since diverged (868 lines there vs 3133 here) and dropped
+# --no-skills outright, which aborts the whole install and surfaces only as
+# "curl: (23) Failure writing output to destination". Every install.sh:<line>
+# reference above points at the tagged script this file was written against.
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/refs/tags/${HERMES_REF}/scripts/install.sh \
         | bash -s -- --skip-setup --skip-browser --no-skills --non-interactive --branch "${HERMES_REF}" \
     && hermes version
 

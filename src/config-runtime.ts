@@ -15,6 +15,13 @@ export interface ResolvedConfig {
   agents: Record<string, AgentConfig>
   retries: number
   concurrency: number
+  /**
+   * Per-test/per-hook timeout (ms) as declared in `agentfoo.config.ts`. Workers
+   * use it to derive the per-turn budget an adapter enforces itself (see
+   * `turnBudgetMs` in fixtures.ts) — without it the only bound on a turn is
+   * vitest's test timeout, which fires while the turn keeps running.
+   */
+  timeout?: number
 }
 
 const DEFAULTS: ResolvedConfig = {
@@ -39,6 +46,7 @@ export function loadConfig(): ResolvedConfig {
     agents: parsed.agents ?? {},
     retries: parsed.retries ?? 0,
     concurrency: Math.max(1, Math.floor(parsed.concurrency ?? 1)),
+    ...(parsed.timeout !== undefined ? { timeout: parsed.timeout } : {}),
   }
   return cached
 }
@@ -129,4 +137,26 @@ function stripUndefined<T extends object>(obj: T): Partial<T> {
 /** Test-only: reset the memoized config (used by unit tests). */
 export function __resetConfigCache(): void {
   cached = undefined
+}
+
+/**
+ * Per-turn budget handed to every adapter: the suite's `timeout` less a margin,
+ * so a runaway turn is killed *inside* its own test instead of outliving it.
+ *
+ * That failure mode produced three separate defects in one regression run
+ * (2026-10-01): artifacts filed under the *next* test, that test's negative
+ * assertion poisoned by the previous turn's late-arriving trace, and 20+ minutes
+ * of real spend per stuck turn. Suites with a small timeout get no adapter-level
+ * bound at all — subtracting the margin would leave a nonsensical budget — and
+ * keep relying on vitest's own timeout, exactly as before.
+ */
+export const TURN_TIMEOUT_MARGIN_MS = 30_000
+
+/** Below this suite timeout the margin would eat the whole budget, so adapters stay unbounded. */
+export const TURN_TIMEOUT_MIN_MS = 60_000
+
+export function turnBudgetMs(): number | undefined {
+  const { timeout } = loadConfig()
+  if (!timeout || timeout <= TURN_TIMEOUT_MIN_MS) return undefined
+  return timeout - TURN_TIMEOUT_MARGIN_MS
 }

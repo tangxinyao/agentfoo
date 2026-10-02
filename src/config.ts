@@ -14,7 +14,12 @@ import { AGENTFOO_REPORTER } from './reporter.js'
  * timeouts, serial execution so containers/LLM calls don't stampede).
  */
 export function defineConfig(config: AgentfooConfig = {}): UserConfig {
-  const { setupFiles, include, timeout, ...agentfoo } = config
+  const { setupFiles, include, timeout, ...rest } = config
+  // `timeout` rides along into the payload as well as driving the two vitest
+  // timeouts below: workers derive their per-turn budget from it (see
+  // `turnBudgetMs` in fixtures.ts) so an adapter kills a runaway turn *before*
+  // vitest gives up on the test that owns it.
+  const agentfoo = { ...rest, ...(timeout !== undefined ? { timeout } : {}) }
 
   // A single agent turn is a full LLM round-trip: a big generation on a slow
   // model can run well past two minutes, so the default is generous and

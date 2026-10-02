@@ -10,6 +10,15 @@ export interface ExecOptions {
    * command running.
    */
   timeoutMs?: number
+  /**
+   * Called for every stdout chunk as it arrives, with the ms elapsed since the
+   * command started. Feeds {@link file://../steps.ts StepRecorder}: without it a
+   * long turn's stream carries no timing at all, so "the model was slow" and "a
+   * tool ran for minutes" cannot be told apart after the fact. Never called for
+   * stderr — the trace envelopes all arrive on stdout, and a diagnostic line on
+   * stderr must not shift the timeline.
+   */
+  onStdoutChunk?: (chunk: string, atMs: number) => void
 }
 
 export interface ExecResult {

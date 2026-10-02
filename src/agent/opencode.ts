@@ -4,8 +4,9 @@ import type { RuntimeEnv } from '../runtime/types.js'
 import type { Agent, AgentBootOptions, RunOptions } from './types.js'
 import { parseOpencodePartTrace } from '../trace.js'
 import { SkillHandle } from '../skill.js'
-import { preview, progress, withHeartbeat } from '../progress.js'
-import { collectCredentials, readSkillName, turnTimedOut } from './shared.js'
+import { preview } from '../progress.js'
+import { collectCredentials, readSkillName } from './shared.js'
+import { execTurn, finishTurn } from './turn.js'
 import { resolveModelProvider } from './hermes.js'
 
 /**
@@ -31,6 +32,8 @@ export class OpencodeAgent implements Agent {
   private readonly config: AgentConfig
   private readonly onTrace?: AgentBootOptions['onTrace']
   private readonly currentTest?: () => string | undefined
+  /** Adapter-enforced per-turn bound (see {@link AgentBootOptions.turnTimeoutMs}). */
+  private readonly turnTimeoutMs?: number
   private readonly credentialEnv: Record<string, string>
 
   private sessionId: string | undefined
@@ -45,6 +48,7 @@ export class OpencodeAgent implements Agent {
     this.config = opts.config
     this.onTrace = opts.onTrace
     this.currentTest = opts.currentTest
+    this.turnTimeoutMs = opts.turnTimeoutMs
     this.credentialEnv = collectCredentials(opts.config.passEnv)
   }
 
@@ -104,23 +108,37 @@ export class OpencodeAgent implements Agent {
       this.reset()
       this.sessionTest = test
     }
+    // Snapshotted for artifact filing: after a test timeout vitest has already
+    // moved the global current-test name on to the next test (TODO §timeout,
+    // see AcpxAgent.run for the failure this caused).
+    const turnTest = test
+    const timeoutMs = opts.timeout ?? this.turnTimeoutMs
     const argv = this.buildRunArgv(prompt)
-    const { stdout, stderr, exitCode, timedOut } = await withHeartbeat(
-      `opencode run: "${preview(prompt)}"`,
-      () => this.env.exec(argv, { env: this.credentialEnv, timeoutMs: opts.timeout }),
-    )
-    if (timedOut) throw turnTimedOut('opencode', prompt, opts.timeout!, stderr || stdout)
-    if (exitCode !== 0) {
-      throw new Error(`opencode run exited ${exitCode}\n${stderr || stdout}`)
-    }
+    // opencode reports each tool already-completed, so model and tool time share
+    // windows here: label the split coarse instead of claiming precision.
+    const outcome = await execTurn({
+      label: `opencode run: "${preview(prompt)}"`,
+      argv,
+      env: this.env,
+      execEnv: this.credentialEnv,
+      timeoutMs,
+      splitQuality: 'coarse',
+    })
+    const trace = await finishTurn(outcome, {
+      label: 'opencode',
+      prompt,
+      timeoutMs,
+      parse: parseOpencodePartTrace,
+      archive: (artifacts) =>
+        this.onTrace?.({ ...artifacts, ...(turnTest !== undefined ? { testName: turnTest } : {}) }),
+      remember: (t) => this.traces.push(t),
+      exitMessage: (r) => `opencode run exited ${r.exitCode}\n${r.stderr || r.stdout}`,
+      // A killed turn's session must not be continued.
+      onBadTurn: () => this.reset(),
+    })
 
-    this.sessionId = extractOpencodeSessionId(stdout) ?? this.sessionId
+    this.sessionId = extractOpencodeSessionId(outcome.result.stdout) ?? this.sessionId
     this.started = true
-
-    const trace = parseOpencodePartTrace(stdout)
-    progress(`  trace: ${trace.messages.length} messages, ${trace.toolCalls.length} tool calls`)
-    this.traces.push(trace)
-    this.onTrace?.({ trace, sessionJsonl: stdout })
     return trace
   }
 

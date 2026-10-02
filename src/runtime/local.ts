@@ -68,6 +68,7 @@ class LocalEnv implements RuntimeEnv {
   exec(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const [cmd, ...args] = argv
     return new Promise((resolve, reject) => {
+      const started = Date.now()
       const child = spawn(cmd, args, {
         cwd: opts.cwd ?? this.workspacePath,
         // New process group (§teardown) so a background process the CLI
@@ -102,7 +103,11 @@ class LocalEnv implements RuntimeEnv {
             }
           }, opts.timeoutMs)
         : undefined
-      child.stdout.on('data', (d) => (stdout += d.toString()))
+      child.stdout.on('data', (d) => {
+        const text = d.toString()
+        stdout += text
+        opts.onStdoutChunk?.(text, Date.now() - started)
+      })
       child.stderr.on('data', (d) => (stderr += d.toString()))
       child.on('error', reject)
       child.on('close', (code) => {

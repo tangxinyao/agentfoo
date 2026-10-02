@@ -5,8 +5,9 @@ import type { Agent, AgentBootOptions, RunOptions } from './types.js'
 import { compactAcpStream, parseAcpTrace } from '../trace.js'
 import { SkillHandle } from '../skill.js'
 import type { SkillDetector } from '../skill.js'
-import { preview, progress, withHeartbeat } from '../progress.js'
-import { collectCredentials, readSkillBody, readSkillName, turnTimedOut } from './shared.js'
+import { preview } from '../progress.js'
+import { collectCredentials, readSkillBody, readSkillName } from './shared.js'
+import { execTurn, finishTurn } from './turn.js'
 import { resolveModelProvider } from './hermes.js'
 import { probeProvider } from './provider-probe.js'
 
@@ -176,6 +177,8 @@ export class AcpxAgent implements Agent {
   private readonly config: AgentConfig
   private readonly onTrace?: AgentBootOptions['onTrace']
   private readonly currentTest?: () => string | undefined
+  /** Adapter-enforced per-turn bound (see {@link AgentBootOptions.turnTimeoutMs}). */
+  private readonly turnTimeoutMs?: number
   private readonly credentialEnv: Record<string, string>
   private readonly label: string
 
@@ -207,6 +210,7 @@ export class AcpxAgent implements Agent {
     this.config = opts.config
     this.onTrace = opts.onTrace
     this.currentTest = opts.currentTest
+    this.turnTimeoutMs = opts.turnTimeoutMs
     this.credentialEnv = collectCredentials(opts.config.passEnv)
     this.label = spec.label ?? spec.agent ?? spec.launchCommand ?? 'acpx'
     this.activeCwd = opts.env.workspacePath
@@ -268,38 +272,49 @@ export class AcpxAgent implements Agent {
 
   async run(prompt: string, opts: RunOptions = {}): Promise<Trace> {
     await this.ensureSession()
+    // The test this turn belongs to, snapshotted *now*. By the time the turn
+    // returns, vitest may have already timed this test out and moved the global
+    // current-test name on to the next one — which is how a 974s openclaw turn's
+    // trace, trigger record and judge all landed under the following test and
+    // turned that test's negative assertion into a false red (TODO §timeout).
+    const turnTest = this.currentTest?.()
+    const timeoutMs = opts.timeout ?? this.turnTimeoutMs
     const effectivePrompt = this.applyForcedSkills(prompt)
     const argv = await this.buildRunArgv(effectivePrompt)
-    const { stdout, stderr, exitCode, timedOut } = await withHeartbeat(
-      `acpx ${this.label} run: "${preview(prompt)}"`,
-      () => this.env.exec(argv, { env: this.execEnv(), timeoutMs: opts.timeout }),
-    )
-    if (timedOut) throw turnTimedOut(`acpx ${this.label}`, prompt, opts.timeout!, stderr || stdout)
-    if (exitCode !== 0) {
-      throw new Error(await this.failure(`exited ${exitCode}`, stderr || stdout))
-    }
-
     // Drop superseded partial-input frames before anything else looks at the
     // stream, so the trace, `trace.raw` and the archived artifact all derive
     // from the same bytes. An agent that streams tool arguments restates the
     // whole input per token: one real pi turn wrote 103.7MB of stdout for a
     // single file (§compactAcpStream). No-op for an agent that doesn't.
-    const session = compactAcpStream(stdout)
-    if (session.length < stdout.length) {
-      progress(`  compacted stream: ${mib(stdout.length)} → ${mib(session.length)}`)
-    }
+    const outcome = await execTurn({
+      label: `acpx ${this.label} run: "${preview(prompt)}"`,
+      argv,
+      env: this.env,
+      execEnv: this.execEnv(),
+      timeoutMs,
+      compact: compactAcpStream,
+    })
 
-    const trace = parseAcpTrace(session)
-    progress(`  trace: ${trace.messages.length} messages, ${trace.toolCalls.length} tool calls`)
-    // Archive *before* the silent-turn check below, so the stream that explains
-    // the failure is on disk by the time the throw reaches the reporter.
-    this.traces.push(trace)
-    this.onTrace?.({ trace, sessionJsonl: session })
-    if (isSilentTurn(trace)) {
-      const probe = await probeProvider(this.config, this.credentialEnv)
-      throw new Error(await this.failure('produced no output', `${silentTurnHint(stderr)}\n\n${probe}`))
-    }
-    return trace
+    // Parse best-effort, archive, *then* throw — the ordering lives in
+    // finishTurn (src/agent/turn.ts) so it cannot be got wrong in one adapter.
+    return await finishTurn(outcome, {
+      label: `acpx ${this.label}`,
+      prompt,
+      timeoutMs,
+      parse: parseAcpTrace,
+      archive: (artifacts) =>
+        this.onTrace?.({ ...artifacts, ...(turnTest !== undefined ? { testName: turnTest } : {}) }),
+      remember: (t) => this.traces.push(t),
+      exitMessage: (r) => this.failure(`exited ${r.exitCode}`, r.stderr || r.stdout),
+      onBadTurn: () => this.reset(),
+      // A turn can parse cleanly and still be empty; the provider probe is what
+      // turns "the agent said nothing" into an actionable message.
+      verify: async (trace, r) => {
+        if (!isSilentTurn(trace)) return undefined
+        const probe = await probeProvider(this.config, this.credentialEnv)
+        return this.failure('produced no output', `${silentTurnHint(r.stderr)}\n\n${probe}`)
+      },
+    })
   }
 
   /** Drop the current session so the next run() starts a fresh cwd conversation. */
@@ -467,11 +482,6 @@ export class AcpxAgent implements Agent {
     if (this.config.extraArgs) argv.push(...this.config.extraArgs)
     return argv
   }
-}
-
-/** Byte count as MiB, for the one progress line that reports a size. */
-function mib(bytes: number): string {
-  return `${(bytes / 1024 / 1024).toFixed(1)}MB`
 }
 
 /**

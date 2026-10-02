@@ -167,3 +167,25 @@ describe('LocalRuntime exec timeout', () => {
     }
   })
 })
+
+describe('LocalRuntime step timing (TODO §timeout)', () => {
+  it('reports every stdout chunk with its arrival time, in order', async () => {
+    const env = await bootEnv('chunks')
+    const seen: Array<{ text: string; atMs: number }> = []
+    try {
+      await env.exec(['sh', '-c', 'echo one; sleep 0.2; echo two'], {
+        onStdoutChunk: (text, atMs) => seen.push({ text, atMs }),
+      })
+    } finally {
+      await env.teardown()
+    }
+
+    // The whole point of feeding chunk timestamps rather than the buffered
+    // result: the silence between two lines has to survive into the timeline.
+    expect(seen.map((s) => s.text).join('')).toContain('one')
+    expect(seen.map((s) => s.text).join('')).toContain('two')
+    const times = seen.map((s) => s.atMs)
+    expect([...times].sort((a, b) => a - b)).toEqual(times)
+    expect(Math.max(...times)).toBeGreaterThanOrEqual(100)
+  })
+})

@@ -46,6 +46,13 @@ const deepseek = {
 }
 
 export default defineConfig({
+  // Live turns here are slow and wildly variable: the same design prompt took
+  // 148s (opencode) / 974s (openclaw) / 1626s (hermes) / 2255s (pi) on this
+  // machine. Anything much under 40 min turns a real turn into a timeout, and a
+  // timed-out turn used to keep running and corrupt the following test's
+  // artifacts — the adapter now kills it 30s before this bound instead
+  // (see turnBudgetMs in src/fixtures.ts).
+  timeout: 3_000_000,
   judge: {
     model: `deepseek/${model}`,
   },

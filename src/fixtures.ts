@@ -6,7 +6,7 @@ import { LocalRuntime } from './runtime/local.js'
 import { DockerRuntime, bundledDockerfile } from './runtime/docker.js'
 import type { Agent } from './agent/types.js'
 import { agentSpec, type AgentSpec } from './agent/registry.js'
-import { loadConfig, resolveAgentConfig, selectedAgentKind } from './config-runtime.js'
+import { loadConfig, resolveAgentConfig, selectedAgentKind, turnBudgetMs } from './config-runtime.js'
 import { recordAgentVersion, recordTestArtifacts } from './artifacts.js'
 import { progress } from './progress.js'
 import { resolveSkillOverride } from './agent/shared.js'
@@ -75,10 +75,17 @@ async function boot(
     // Lets the adapter start a fresh session at each test boundary (§4) while
     // staying vitest-agnostic itself — the vitest dependency lives here.
     currentTest: testName,
-    onTrace: ({ trace, sessionJsonl }) => {
+    // A turn that outlives its test is killed by the adapter rather than left
+    // running (TODO §timeout): the fixture layer owns the policy because this is
+    // where the suite's `timeout` is readable and where vitest's semantics live.
+    turnTimeoutMs: turnBudgetMs(),
+    onTrace: (info) => {
       turn++
       try {
-        recordTestArtifacts(testName() ?? 'unknown', { trace, sessionJsonl, turn })
+        // `info.testName` — not `testName()` — is the test this turn belongs to.
+        // Adapters snapshot it when run() *starts*; re-resolving it here would
+        // name the *next* test once a timeout has moved the global state on.
+        recordTestArtifacts(info.testName ?? testName() ?? 'unknown', { ...info, turn })
       } catch {
         // Artifact writing must never fail a test.
       }
@@ -223,6 +230,12 @@ async function noteLocalVersion(kind: string, argv: string[], env: RuntimeEnv): 
   }
 }
 
+/**
+ * The suite's `timeout` less a margin is enforced by each adapter as its own
+ * per-turn bound (see `turnBudgetMs` in config-runtime.ts): a runaway turn is
+ * killed *inside* its own test instead of outliving it and corrupting the next
+ * one. Suites with a small timeout get no adapter-level bound at all.
+ */
 function selectRuntime(config: AgentConfig, spec: AgentSpec): Runtime {
   const forceLocal = process.env.AGENTFOO_FORCE_LOCAL === '1'
   if (forceLocal || config.runtime === 'local') return new LocalRuntime()

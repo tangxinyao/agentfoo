@@ -128,13 +128,16 @@ class DockerEnv implements RuntimeEnv {
     const seconds = opts.timeoutMs ? Math.max(1, Math.ceil(opts.timeoutMs / 1000)) : 0
     const wrapped = seconds ? ['timeout', '-s', 'KILL', String(seconds), ...argv] : argv
     const started = Date.now()
-    const result = await runDockerExec([
-      'exec',
-      '-w', opts.cwd ?? this.workspacePath,
-      ...envArgs,
-      this.container,
-      ...wrapped,
-    ])
+    const result = await runDockerExec(
+      [
+        'exec',
+        '-w', opts.cwd ?? this.workspacePath,
+        ...envArgs,
+        this.container,
+        ...wrapped,
+      ],
+      opts.onStdoutChunk,
+    )
     if (seconds && result.exitCode === 137 && Date.now() - started >= seconds * 1000 - 500) {
       return { ...result, timedOut: true }
     }
@@ -248,13 +251,20 @@ const DOCKER_ITSELF_FAILED = 125
  * docker's own exit-125 convention rejects; every other case is a legitimate
  * result of running the command, not a failure of `runDockerExec` itself.
  */
-function runDockerExec(args: string[]): Promise<ExecResult> {
+function runDockerExec(args: string[], onStdoutChunk?: (chunk: string, atMs: number) => void): Promise<ExecResult> {
   const [bin, ...prefix] = dockerCommand()
   return new Promise((resolve, reject) => {
+    const started = Date.now()
     const child = spawn(bin, [...prefix, ...args], { stdio: 'pipe' })
     let stdout = ''
     let stderr = ''
-    child.stdout?.on('data', (d) => (stdout += d.toString()))
+    child.stdout?.on('data', (d) => {
+      const text = d.toString()
+      stdout += text
+      // Fed straight from the pipe, not from the buffered result: the arrival
+      // time is the whole point (see ExecOptions.onStdoutChunk).
+      onStdoutChunk?.(text, Date.now() - started)
+    })
     child.stderr?.on('data', (d) => (stderr += d.toString()))
     child.on('error', reject)
     child.on('close', (code) => {
