@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { takeOption } from './cli-args.js'
+import { latestRun, suggest } from './suggest.js'
+import { optimize } from './optimize.js'
+import { serveCompare, serveReview } from './review.js'
+import { compare, formatCompare } from './compare.js'
+import { optimizeDescription } from './optimize-description.js'
+import { formatScore, score } from './score.js'
 
 /**
  * `agentfoo` CLI (§ "CLI 一览"). A thin translation layer over the vitest CLI so
@@ -21,6 +27,14 @@ import { takeOption } from './cli-args.js'
  *   agentfoo list                     → vitest list  (collect specs, no LLM calls)
  *   agentfoo watch                    → vitest (watch) --config agentfoo.config.ts
  *   agentfoo run --env-file path/.env → load that .env instead of the nearest one
+ *   agentfoo suggest skills/foo       → propose bounded SKILL.md edits from the latest run
+ *   agentfoo optimize skills/foo --train '\[train/' --sel '\[sel/'
+ *                                     → SkillOpt loop: train run → suggest → gated sel run
+ *   agentfoo review [--run <id>]      → local page to rate answers, check judge verdicts, edit criteria
+ *   agentfoo score --repeat 3 [filters] → run the suite n times; per-case mean ± spread
+ *   agentfoo compare <skill-A> <skill-B> [filters] → same suite on two versions + pairwise judge
+ *   agentfoo review --compare [<dir>] → blind side-by-side human preference for a compare
+ *   agentfoo optimize-description <skill> --train '<p>' --sel '<p>' → tune `description` for trigger F1
  */
 function main(): void {
   const rawArgs = process.argv.slice(2)
@@ -42,6 +56,153 @@ function main(): void {
   else loadDotenv(process.cwd())
 
   const [verb, ...rest] = cliArgs
+
+  if (verb === 'score') {
+    const { value: repeat, args: vitestArgs } = takeOption(rest, ['--repeat', '-n'])
+    const n = Number(repeat ?? 3)
+    if (!Number.isInteger(n) || n < 2) {
+      console.error('agentfoo score: --repeat must be an integer ≥ 2 (a spread needs at least two runs)')
+      process.exit(1)
+    }
+    if (agentKind) process.env.AGENTFOO_AGENT = agentKind
+    const stamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, '')
+    const outDir = join(process.cwd(), '.agentfoo', 'score', stamp)
+    score({ repeat: n, vitestArgs, outDir, log: (m) => console.error(`  agentfoo score  ${m}`) })
+      .then((r) => {
+        console.log(`\n${formatScore(r)}\n\n  Details: ${join(outDir, 'score.json')}`)
+      })
+      .catch((err: Error) => {
+        console.error(`agentfoo score: ${err.message}`)
+        process.exit(1)
+      })
+    return
+  }
+
+  if (verb === 'optimize-description') {
+    let args = rest
+    const opt = (names: string[]) => {
+      const r = takeOption(args, names)
+      args = r.args
+      return r.value
+    }
+    const train = opt(['--train'])
+    const sel = opt(['--sel'])
+    const steps = opt(['--steps'])
+    const candidates = opt(['--candidates'])
+    const margin = opt(['--margin'])
+    const model = opt(['--model'])
+    const [skillArg, ...extra] = args
+    if (!skillArg || extra.length || !train || !sel) {
+      console.error(
+        "usage: agentfoo optimize-description <skill-dir> --train '<pattern>' --sel '<pattern>' " +
+          '[--steps 3] [--candidates 3] [--margin 0] [--model provider/model]',
+      )
+      process.exit(1)
+    }
+    if (agentKind) process.env.AGENTFOO_AGENT = agentKind
+    const last = latestRun()
+    const optimizerModel =
+      model || process.env.AGENTFOO_OPTIMIZER_MODEL || (last ? judgeModelOf(join(process.cwd(), '.agentfoo', 'runs', last)) : undefined)
+    if (!optimizerModel) {
+      console.error('agentfoo optimize-description: pass --model provider/model or set AGENTFOO_OPTIMIZER_MODEL')
+      process.exit(1)
+    }
+    const stamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, '')
+    const outDir = join(process.cwd(), '.agentfoo', 'optimize-description', stamp)
+    const num = (v: string | undefined) => (v === undefined ? undefined : Number(v))
+    optimizeDescription({
+      skillDir: resolveCwd(skillArg),
+      trainFilter: train,
+      selFilter: sel,
+      optimizer: { model: optimizerModel },
+      outDir,
+      steps: num(steps),
+      candidates: num(candidates),
+      margin: num(margin),
+      log: (m) => console.error(`  agentfoo optimize-description  ${m}`),
+    })
+      .then((r) => {
+        console.log(`\n  trigger F1 ${r.baseline.f1.toFixed(3)} → ${r.best.f1.toFixed(3)} on the selection split`)
+        console.log(`  before: ${r.baseline.description}`)
+        console.log(`  after:  ${r.best.description}`)
+        console.log(`\n  Best skill: ${join(r.bestDir, 'SKILL.md')} (only the description differs)`)
+        console.log('  The original skill was not modified.')
+      })
+      .catch((err: Error) => {
+        console.error(`agentfoo optimize-description: ${err.message}`)
+        process.exit(1)
+      })
+    return
+  }
+
+  if (verb === 'compare') {
+    let args = rest
+    const opt = (names: string[]) => {
+      const r = takeOption(args, names)
+      args = r.args
+      return r.value
+    }
+    const judgeModel = opt(['--judge-model'])
+    const criteria = opt(['--criteria'])
+    const noJudge = args.includes('--no-judge')
+    args = args.filter((a) => a !== '--no-judge')
+    const [aArg, bArg, ...vitestArgs] = args
+    if (!aArg || !bArg) {
+      console.error(
+        'usage: agentfoo compare <skill-dir-A> <skill-dir-B> [--judge-model p/m] [--criteria "…"] [--no-judge] [vitest filters]',
+      )
+      process.exit(1)
+    }
+    if (agentKind) process.env.AGENTFOO_AGENT = agentKind
+    const model = judgeModel || process.env.AGENTFOO_OPTIMIZER_MODEL || (() => {
+      const last = latestRun()
+      return last ? judgeModelOf(join(process.cwd(), '.agentfoo', 'runs', last)) : undefined
+    })()
+    if (!noJudge && !model) {
+      console.error('agentfoo compare: no judge model — pass --judge-model provider/model, or --no-judge for human-only')
+      process.exit(1)
+    }
+    const stamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, '')
+    const outDir = join(process.cwd(), '.agentfoo', 'compare', stamp)
+    compare({
+      aDir: resolveCwd(aArg),
+      bDir: resolveCwd(bArg),
+      vitestArgs,
+      judge: noJudge ? undefined : { model: model! },
+      criteria,
+      outDir,
+      log: (m) => console.error(`  agentfoo compare  ${m}`),
+    })
+      .then((r) => {
+        console.log(`\n${formatCompare(r)}\n\n  Details: ${join(outDir, 'compare.json')}`)
+        console.log(`  Human blind review: agentfoo review --compare ${outDir}`)
+      })
+      .catch((err: Error) => {
+        console.error(`agentfoo compare: ${err.message}`)
+        process.exit(1)
+      })
+    return
+  }
+
+  if (verb === 'review') {
+    runReview(rest).catch((err: Error) => {
+      console.error(`agentfoo review: ${err.message}`)
+      process.exit(1)
+    })
+    return
+  }
+
+  if (verb === 'suggest' || verb === 'optimize') {
+    // The runs `optimize` spawns must drive the same agent this invocation was
+    // pointed at; `.env` values are already in process.env.
+    if (agentKind) process.env.AGENTFOO_AGENT = agentKind
+    const job = verb === 'suggest' ? runSuggest(rest) : runOptimize(rest)
+    job.catch((err: Error) => {
+      console.error(`agentfoo ${verb}: ${err.message}`)
+      process.exit(1)
+    })
+    return
+  }
 
   const env = { ...process.env }
   // The vitest workers write progress to a pipe, not this terminal, so they
@@ -108,6 +269,180 @@ function main(): void {
   }
 
   launchVitest(vitestArgs, env)
+}
+
+/**
+ * `agentfoo suggest <skill-dir> [--run <id>] [--budget n] [--batch n] [--model provider/model]`
+ *
+ * No vitest involved: reads a finished run's artifacts and calls the optimizer
+ * model directly. The optimizer defaults to `AGENTFOO_OPTIMIZER_MODEL`, else the
+ * judge model recorded in that run's gradings — the CLI doesn't load
+ * agentfoo.config.ts, and the run already says which model graded it.
+ */
+async function runSuggest(argv: string[]): Promise<void> {
+  const run = takeOption(argv, ['--run'])
+  const budget = takeOption(run.args, ['--budget'])
+  const batch = takeOption(budget.args, ['--batch'])
+  const model = takeOption(batch.args, ['--model'])
+  const [skillArg, ...extra] = model.args
+  if (!skillArg || extra.length) {
+    throw new Error(
+      'usage: agentfoo suggest <skill-dir> [--run <run-id>] [--budget 4] [--batch 8] [--model provider/model]',
+    )
+  }
+  const skillDir = resolveCwd(skillArg)
+  if (!existsSync(join(skillDir, 'SKILL.md'))) throw new Error(`no SKILL.md in ${skillDir}`)
+
+  const runId = run.value || latestRun()
+  if (!runId) throw new Error('no run with a report.json under .agentfoo/runs — run the eval first')
+  const runPath = join(process.cwd(), '.agentfoo', 'runs', runId)
+
+  const optimizerModel = model.value || process.env.AGENTFOO_OPTIMIZER_MODEL || judgeModelOf(runPath)
+  if (!optimizerModel) {
+    throw new Error('no optimizer model: pass --model provider/model or set AGENTFOO_OPTIMIZER_MODEL')
+  }
+
+  const stamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, '')
+  const outDir = join(process.cwd(), '.agentfoo', 'suggest', `${runId}__${stamp}`)
+  const log = (msg: string) => console.error(`  agentfoo suggest  ${msg}`)
+  log(`run ${runId}, optimizer ${optimizerModel}`)
+
+  const result = await suggest({
+    skillDir,
+    runPath,
+    optimizer: { model: optimizerModel },
+    budget: budget.value ? Number(budget.value) : undefined,
+    batchSize: batch.value ? Number(batch.value) : undefined,
+    outDir,
+    log,
+  })
+
+  const applied = result.results.filter((r) => r.applied).length
+  console.log(`\n  ${applied}/${result.results.length} edits applied to a copy of SKILL.md`)
+  for (const r of result.results) {
+    console.log(`    ${r.applied ? '✓' : '✗'} ${r.edit.op}: ${r.edit.rationale.slice(0, 100)}${r.applied ? '' : ` (${r.reason})`}`)
+  }
+  console.log(`\n  Review: ${join(outDir, 'suggestions.md')}`)
+  console.log(`  Diff:   ${join(outDir, 'SKILL.md.diff')}`)
+}
+
+/**
+ * `agentfoo optimize <skill-dir> --train <pattern> --sel <pattern> [--epochs 2]
+ *  [--steps 2] [--budget 4] [--min-budget 2] [--margin 0] [--model provider/model]`
+ *
+ * `--train` / `--sel` are vitest `-t` name patterns picking each split out of the
+ * suite. Spawns `agentfoo run` for every evaluation, so a full default run is
+ * 1 + 4×2 = 9 suite runs — plan the cost before starting one.
+ */
+async function runOptimize(argv: string[]): Promise<void> {
+  let args = argv
+  const opt = (names: string[]) => {
+    const r = takeOption(args, names)
+    args = r.args
+    return r.value
+  }
+  const train = opt(['--train'])
+  const sel = opt(['--sel'])
+  const epochs = opt(['--epochs'])
+  const steps = opt(['--steps'])
+  const budget = opt(['--budget'])
+  const minBudget = opt(['--min-budget'])
+  const margin = opt(['--margin'])
+  const baselineRuns = opt(['--baseline-runs'])
+  const gate = opt(['--gate'])
+  const model = opt(['--model'])
+  const noSlow = args.includes('--no-slow-update')
+  const noMeta = args.includes('--no-meta')
+  args = args.filter((a) => a !== '--no-slow-update' && a !== '--no-meta')
+  if (gate !== undefined && gate !== 'score' && gate !== 'pairwise') throw new Error('--gate must be score or pairwise')
+  const [skillArg, ...extra] = args
+  if (!skillArg || extra.length || !train || !sel) {
+    throw new Error(
+      "usage: agentfoo optimize <skill-dir> --train '<pattern>' --sel '<pattern>' [--epochs 2] [--steps 2] " +
+        '[--budget 4] [--min-budget 2] [--margin 0|auto] [--baseline-runs n] [--gate score|pairwise] ' +
+        '[--no-slow-update] [--no-meta] [--model provider/model]',
+    )
+  }
+  const skillDir = resolveCwd(skillArg)
+  if (!existsSync(join(skillDir, 'SKILL.md'))) throw new Error(`no SKILL.md in ${skillDir}`)
+  const last = latestRun()
+  const optimizerModel =
+    model || process.env.AGENTFOO_OPTIMIZER_MODEL || (last ? judgeModelOf(join(process.cwd(), '.agentfoo', 'runs', last)) : undefined)
+  if (!optimizerModel) {
+    throw new Error('no optimizer model: pass --model provider/model or set AGENTFOO_OPTIMIZER_MODEL')
+  }
+
+  const stamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, '')
+  const outDir = join(process.cwd(), '.agentfoo', 'optimize', stamp)
+  const log = (msg: string) => console.error(`  agentfoo optimize  ${msg}`)
+  log(`optimizer ${optimizerModel}, output ${outDir}`)
+
+  const num = (v: string | undefined) => (v === undefined ? undefined : Number(v))
+  const result = await optimize({
+    skillDir,
+    trainFilter: train,
+    selFilter: sel,
+    optimizer: { model: optimizerModel },
+    outDir,
+    epochs: num(epochs),
+    stepsPerEpoch: num(steps),
+    budget: num(budget),
+    minBudget: num(minBudget),
+    margin: margin === 'auto' ? 'auto' : num(margin),
+    baselineRuns: num(baselineRuns),
+    gate: gate as 'score' | 'pairwise' | undefined,
+    slowUpdate: !noSlow,
+    metaMemory: !noMeta,
+    log,
+  })
+
+  const accepted = result.steps.filter((s) => s.accepted).length
+  console.log(
+    `\n  selection score ${result.baseline.toFixed(3)} → ${result.best.toFixed(3)} ` +
+      `(${accepted}/${result.steps.length} steps accepted)`,
+  )
+  console.log(`  Best skill: ${join(result.bestDir, 'SKILL.md')}`)
+  console.log(`  History:    ${join(outDir, 'history.json')}`)
+  console.log('  The original skill was not modified; the test split was never run — evaluate best/ on it yourself.')
+}
+
+/** `agentfoo review [--run <id>] [--port 4173]` — serve the human review page until Ctrl-C. */
+async function runReview(argv: string[]): Promise<void> {
+  const run = takeOption(argv, ['--run'])
+  const port = takeOption(run.args, ['--port'])
+  const cmp = takeOption(port.args, ['--compare'])
+  if (cmp.value !== undefined || argv.includes('--compare')) {
+    const dir = cmp.value ? resolveCwd(cmp.value) : latestCompare()
+    if (!dir) throw new Error('no compare under .agentfoo/compare — run agentfoo compare first')
+    const { url } = await serveCompare(dir, port.value ? Number(port.value) : 4174)
+    console.log(`\n  Blind comparison ${dir}`)
+    console.log(`  Open ${url}  (127.0.0.1 only; remote: ssh -L ${new URL(url).port}:127.0.0.1:${new URL(url).port} <host>)`)
+    console.log(`  Saves to ${join(dir, 'preferences.json')}. Ctrl-C to stop.\n`)
+    return
+  }
+  if (cmp.args.length) throw new Error('usage: agentfoo review [--run <run-id>] [--port 4173] | --compare [<dir>]')
+  const runId = run.value || latestRun()
+  if (!runId) throw new Error('no run with a report.json under .agentfoo/runs — run the eval first')
+  const runPath = join(process.cwd(), '.agentfoo', 'runs', runId)
+  const { url } = await serveReview(runPath, port.value ? Number(port.value) : 4173)
+  console.log(`\n  Reviewing run ${runId}`)
+  console.log(`  Open ${url}  (bound to 127.0.0.1; on a remote host: ssh -L ${new URL(url).port}:127.0.0.1:${new URL(url).port} <host>)`)
+  console.log(`  Saves to ${join(runPath, 'review.json')} as you go. Ctrl-C to stop.\n`)
+}
+
+function latestCompare(): string | undefined {
+  const root = join(process.cwd(), '.agentfoo', 'compare')
+  if (!existsSync(root)) return undefined
+  const last = readdirSync(root).filter((d) => existsSync(join(root, d, 'compare.json'))).sort().at(-1)
+  return last ? join(root, last) : undefined
+}
+
+/** The judge model named in any grading of this run, for a default optimizer. */
+function judgeModelOf(runPath: string): string | undefined {
+  const entries = readdirSync(runPath, { recursive: true }) as string[]
+  const file = entries.find((e) => /(^|\/)judge-\d+\.json$/.test(e))
+  if (!file) return undefined
+  return (JSON.parse(readFileSync(join(runPath, file), 'utf8')) as { model?: string }).model
 }
 
 /**
