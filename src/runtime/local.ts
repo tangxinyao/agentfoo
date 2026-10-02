@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
-import { cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { AgentHome, ExecOptions, ExecResult, Runtime, RuntimeEnv } from './types.js'
 
 /**
@@ -91,10 +91,24 @@ class LocalEnv implements RuntimeEnv {
       if (child.pid) this.pids.add(child.pid)
       let stdout = ''
       let stderr = ''
+      let timedOut = false
+      const timer = opts.timeoutMs
+        ? setTimeout(() => {
+            timedOut = true
+            try {
+              process.kill(-(child.pid as number), 'SIGKILL') // the whole group, not just the leader
+            } catch {
+              // already gone
+            }
+          }, opts.timeoutMs)
+        : undefined
       child.stdout.on('data', (d) => (stdout += d.toString()))
       child.stderr.on('data', (d) => (stderr += d.toString()))
       child.on('error', reject)
-      child.on('close', (code) => resolve({ stdout, stderr, exitCode: code ?? -1 }))
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        resolve({ stdout, stderr, exitCode: code ?? -1, ...(timedOut ? { timedOut } : {}) })
+      })
     })
   }
 
@@ -105,6 +119,11 @@ class LocalEnv implements RuntimeEnv {
 
   readFile(path: string): Promise<string> {
     return readFile(path, 'utf8')
+  }
+
+  async writeFile(path: string, content: string): Promise<void> {
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, content)
   }
 
   /**

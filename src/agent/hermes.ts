@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import type { AgentConfig } from '../types.js'
 import type { AcpxSpec } from './acpx.js'
 import { reasoningReferenceDetector } from '../skill.js'
+import { inlineSkillPrompt } from './shared.js'
 
 /**
  * hermes-agent (NousResearch) driven through the acpx ACP client, NOT its own
@@ -92,16 +93,8 @@ export const hermesAcpxSpec: AcpxSpec = {
    * model regardless of bridge internals, at the cost of prompt-level (not
    * true system-prompt-level) placement.
    */
-  forceSkill: ({ skillBody, prompt }) =>
-    `The following skill is active for this task — follow its instructions:\n\n` +
-    `${skillBody}\n\n---\n\n${prompt}`,
+  forceSkill: inlineSkillPrompt,
   async init({ env, config }): Promise<void> {
-    const yaml = renderConfigYaml(config)
-    await env.exec(['sh', '-c', `mkdir -p "${env.agentHome}"`])
-    await env.exec([
-      'sh',
-      '-c',
-      `cat > "${join(env.agentHome, 'config.yaml')}" <<'AGENTFOO_EOF'\n${yaml}\nAGENTFOO_EOF`,
-    ])
+    await env.writeFile(join(env.agentHome, 'config.yaml'), `${renderConfigYaml(config)}\n`)
   },
 }

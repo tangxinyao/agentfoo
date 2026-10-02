@@ -107,6 +107,9 @@ function fakeEnv(
       calls.push(argv)
       return { stdout: '', stderr: '', exitCode: 0, ...route(argv) }
     },
+    async writeFile(path: string, content: string) {
+      calls.push(['writeFile', path, content])
+    },
     async copyDir() {},
     async readFile() {
       return ''
@@ -131,9 +134,8 @@ describe('piAcpxSpec.init', () => {
 
     await agent.init()
 
-    expect(env.calls[0]).toEqual(['sh', '-c', 'mkdir -p "/tmp/agenthome"'])
-    expect(env.calls[1][2]).toContain('cat > "/tmp/agenthome/models.json"')
-    expect(env.calls[1][2]).toContain('"baseUrl": "https://api.deepseek.com"')
+    expect(env.calls[0].slice(0, 2)).toEqual(['writeFile', '/tmp/agenthome/models.json'])
+    expect(env.calls[0][2]).toContain('"baseUrl": "https://api.deepseek.com"')
   })
 
   it('writes nothing when the provider needs no custom endpoint', async () => {
@@ -298,5 +300,60 @@ describe('compactAcpStream', () => {
   it('passes through non-JSON banner lines rather than eating them', () => {
     const withBanner = '[acpx] agent: pi\n{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
     expect(compactAcpStream(withBanner)).toContain('[acpx] agent: pi')
+  })
+})
+
+const frontendDesignDir = fileURLToPath(
+  new URL('../example/skills/frontend-design', import.meta.url),
+)
+
+describe('pi forced skill mode (TODO §P1)', () => {
+  const agentReply =
+    '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":' +
+    '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}}'
+
+  it('inlines SKILL.md ahead of the prompt and says where the skill lives', async () => {
+    const env = fakeEnv((argv) => (argv.includes('--format') ? { stdout: agentReply } : {}))
+    const agent = boot(env)
+
+    const handle = await agent.loadSkill(frontendDesignDir, { force: true })
+    await agent.run('今天北京的天气怎么样？')
+
+    const sent = env.calls.find((c) => c.includes('--format'))!.at(-1)!
+    expect(sent).toContain('name: frontend-design')
+    expect(sent).toContain('/tmp/agenthome/skills/frontend-design')
+    expect(sent.endsWith('今天北京的天气怎么样？')).toBe(true)
+    expect(() => handle.calls()).toThrow(/force: true/)
+  })
+
+  // A file-scoped agent with a per-test skill fixture calls loadSkill once per
+  // test; without dedup the Nth test's prompt carried N copies of SKILL.md.
+  it('injects a skill once however many times it is force-loaded', async () => {
+    const env = fakeEnv((argv) => (argv.includes('--format') ? { stdout: agentReply } : {}))
+    const agent = boot(env)
+
+    await agent.loadSkill(frontendDesignDir, { force: true })
+    await agent.loadSkill(frontendDesignDir, { force: true })
+    await agent.run('hello')
+
+    const sent = env.calls.find((c) => c.includes('--format'))!.at(-1)!
+    expect(sent.split('name: frontend-design')).toHaveLength(2)
+  })
+})
+
+describe('per-turn timeout', () => {
+  it('passes the limit down to exec and rejects naming the turn when it fires', async () => {
+    const seen: Array<number | undefined> = []
+    const env = fakeEnv((argv) => (argv.includes('--format') ? { stdout: '', stderr: 'still thinking', timedOut: true } : {}))
+    const exec = env.exec.bind(env)
+    env.exec = async (argv, opts) => {
+      if (argv.includes('--format')) seen.push(opts?.timeoutMs)
+      return exec(argv, opts)
+    }
+    const agent = boot(env)
+    await expect(agent.run('写一篇很长的文章', { timeout: 90_000 })).rejects.toThrow(
+      /acpx pi turn exceeded its 90s timeout and was killed: "写一篇很长的文章"[\s\S]*still thinking/,
+    )
+    expect(seen).toEqual([90_000])
   })
 })

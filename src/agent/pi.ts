@@ -3,6 +3,7 @@ import type { AgentConfig } from '../types.js'
 import type { AcpxSpec } from './acpx.js'
 import { skillFileReadDetector } from '../skill.js'
 import { resolveModelProvider } from './hermes.js'
+import { inlineSkillPrompt } from './shared.js'
 
 /**
  * pi (https://github.com/mariozechner/pi, npm `@mariozechner/pi-coding-agent`)
@@ -103,14 +104,16 @@ export const piAcpxSpec: AcpxSpec = {
   // and the model `read`s the one it wants, so the firing signal is that file
   // read, not a tool named after the skill (§5, verified against a real trace).
   skillDetector: skillFileReadDetector,
+  // Forced mode (TODO §P1) uses the same lever as hermes, for the same reason:
+  // pi-acp advertises no per-skill commands over ACP (no `available_commands_update`
+  // in any captured pi stream), so there is no native `/skill:<name>` to send, and
+  // prompt-level inlining reaches the model regardless of bridge internals. pi still
+  // lists the copied skill in its system prompt, so it may *also* read SKILL.md —
+  // harmless, and forced handles reject the discovery spy anyway.
+  forceSkill: inlineSkillPrompt,
   async init({ env, config }): Promise<void> {
     const json = renderPiModelsJson(config)
     if (!json) return
-    await env.exec(['sh', '-c', `mkdir -p "${env.agentHome}"`])
-    await env.exec([
-      'sh',
-      '-c',
-      `cat > "${join(env.agentHome, 'models.json')}" <<'AGENTFOO_EOF'\n${json}\nAGENTFOO_EOF`,
-    ])
+    await env.writeFile(join(env.agentHome, 'models.json'), `${json}\n`)
   },
 }

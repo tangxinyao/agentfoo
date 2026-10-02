@@ -119,17 +119,26 @@ class DockerEnv implements RuntimeEnv {
     readonly homeEnvVar: string,
   ) {}
 
-  exec(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
+  async exec(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const envArgs = Object.entries({ [this.homeEnvVar]: this.agentHome, ...opts.env }).flatMap(
       ([k, v]) => ['-e', `${k}=${v}`],
     )
-    return runDockerExec([
+    // coreutils `timeout` inside the container: killing the host-side `docker
+    // exec` client would leave the command itself running. SIGKILL → exit 137.
+    const seconds = opts.timeoutMs ? Math.max(1, Math.ceil(opts.timeoutMs / 1000)) : 0
+    const wrapped = seconds ? ['timeout', '-s', 'KILL', String(seconds), ...argv] : argv
+    const started = Date.now()
+    const result = await runDockerExec([
       'exec',
       '-w', opts.cwd ?? this.workspacePath,
       ...envArgs,
       this.container,
-      ...argv,
+      ...wrapped,
     ])
+    if (seconds && result.exitCode === 137 && Date.now() - started >= seconds * 1000 - 500) {
+      return { ...result, timedOut: true }
+    }
+    return result
   }
 
   async copyDir(hostSrc: string, dest: string): Promise<void> {
@@ -141,6 +150,16 @@ class DockerEnv implements RuntimeEnv {
   async readFile(path: string): Promise<string> {
     const { stdout } = await this.exec(['cat', path])
     return stdout
+  }
+
+  async writeFile(path: string, content: string): Promise<void> {
+    // Content travels base64-encoded as a positional argument: no shell ever
+    // parses it, so quotes, `$`, backslashes and heredoc delimiters are inert.
+    const b64 = Buffer.from(content, 'utf8').toString('base64')
+    const { exitCode, stderr } = await this.exec([
+      'sh', '-c', 'mkdir -p "$(dirname "$1")" && printf %s "$2" | base64 -d > "$1"', 'sh', path, b64,
+    ])
+    if (exitCode !== 0) throw new Error(`writeFile ${path} failed (${exitCode}): ${stderr.trim()}`)
   }
 
   async teardown(): Promise<void> {

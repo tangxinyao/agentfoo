@@ -3,12 +3,21 @@ export interface ExecOptions {
   env?: Record<string, string>
   /** Working directory inside the environment. Defaults to the workspace. */
   cwd?: string
+  /**
+   * Kill the command after this many ms and resolve with `timedOut: true`. The
+   * kill happens where the process lives — the local process group, or inside
+   * the container — since killing only a `docker exec` client leaves the
+   * command running.
+   */
+  timeoutMs?: number
 }
 
 export interface ExecResult {
   stdout: string
   stderr: string
   exitCode: number
+  /** Set when {@link ExecOptions.timeoutMs} fired. */
+  timedOut?: boolean
 }
 
 /**
@@ -35,6 +44,13 @@ export interface RuntimeEnv {
   /** Copy a host directory's contents into `dest` inside the env. */
   copyDir(hostSrc: string, dest: string): Promise<void>
   readFile(path: string): Promise<string>
+  /**
+   * Write `content` to `path` inside the env, creating parent dirs. The one way
+   * adapters put config files into place: the old per-adapter `cat <<'EOF'`
+   * heredocs broke on any content containing the delimiter and were
+   * shell-quoting sensitive for YAML and `${VAR}` references (TODO §P3).
+   */
+  writeFile(path: string, content: string): Promise<void>
   teardown(): Promise<void>
 }
 

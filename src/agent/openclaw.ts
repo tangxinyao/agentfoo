@@ -5,6 +5,7 @@ import type { AcpxSpec } from './acpx.js'
 import { skillFileReadDetector } from '../skill.js'
 import { resolveModelProvider } from './hermes.js'
 import { progress } from '../progress.js'
+import { inlineSkillPrompt } from './shared.js'
 
 /**
  * OpenClaw (https://docs.openclaw.ai) driven through the acpx ACP client as the
@@ -59,20 +60,40 @@ import { progress } from '../progress.js'
  * {@link openclawAcpxSpec.diagnose} is for.
  */
 
-/** Loopback port the Gateway listens on, and the bridge dials. */
+/**
+ * Fallback loopback port for the Gateway, used only when probing for a free one
+ * fails. Each instance otherwise gets its own port ({@link pickGatewayPort}): in
+ * Docker every container has its own netns so a fixed port was harmless, but on
+ * the host (`--local`) a second instance either failed to bind or — with
+ * `--force` — silently took over the first one's gateway, config and skills
+ * (TODO §P1.5).
+ */
 export const OPENCLAW_GATEWAY_PORT = 18789
 
-/** Where {@link startGateway} redirects the daemon's stdio, for `diagnose`. */
-const GATEWAY_LOG = '/tmp/openclaw-gateway.log'
+/** Gateway port per agent home, so `diagnose` probes the port `init` chose. */
+const gatewayPorts = new Map<string, number>()
+
+/** Where {@link startGateway} redirects the daemon's stdio — per instance, not a shared /tmp path. */
+const gatewayLog = (env: RuntimeEnv) => join(env.agentHome, 'gateway.log')
 
 /**
  * Shell snippet that exits 0 iff something accepts a TCP connection on the
  * Gateway port. `openclaw health` cannot serve as this probe: it exits 0 even
  * with the gateway down, because it reports on the pipeline rather than the port.
  */
-const connectProbe =
-  `node -e 'require("net").connect(${OPENCLAW_GATEWAY_PORT},"127.0.0.1")` +
+const connectProbe = (port: number) =>
+  `node -e 'require("net").connect(${port},"127.0.0.1")` +
   `.on("connect",()=>process.exit(0)).on("error",()=>process.exit(1))'`
+
+/** Ask the env's own kernel for a free loopback port (node is present wherever openclaw is). */
+async function pickGatewayPort(env: RuntimeEnv): Promise<number> {
+  const { stdout, exitCode } = await env.exec([
+    'node', '-e',
+    'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})',
+  ])
+  const port = Number(stdout.trim())
+  return exitCode === 0 && Number.isInteger(port) && port > 0 ? port : OPENCLAW_GATEWAY_PORT
+}
 
 /**
  * Render openclaw's `openclaw.json`. Unlike pi's `models.json` this is never
@@ -89,14 +110,14 @@ const connectProbe =
  * the env var at load time, so the secret keeps arriving through `passEnv` and
  * never lands on the container's disk.
  */
-export function renderOpenclawJson(config: AgentConfig): string {
+export function renderOpenclawJson(config: AgentConfig, port = OPENCLAW_GATEWAY_PORT): string {
   const { model, provider } = resolveModelProvider(config)
   const apiKeyEnv = config.passEnv?.[0]
 
   const doc: Record<string, unknown> = {
     // A local, loopback-bound, unauthenticated daemon: it exists only to serve
     // the ACP bridge inside this one container, and never leaves it.
-    gateway: { mode: 'local', auth: { mode: 'none' }, port: OPENCLAW_GATEWAY_PORT, bind: 'loopback' },
+    gateway: { mode: 'local', auth: { mode: 'none' }, port, bind: 'loopback' },
     agents: {
       defaults: {
         ...(model ? { model: { primary: provider ? `${provider}/${model}` : model } } : {}),
@@ -147,12 +168,13 @@ export function renderOpenclawJson(config: AgentConfig): string {
  * would otherwise hit; `--force` makes a re-boot in a reused container replace a
  * stale daemon instead of failing on the bound port.
  */
-async function startGateway(env: RuntimeEnv, credentialEnv: Record<string, string>): Promise<void> {
+async function startGateway(env: RuntimeEnv, credentialEnv: Record<string, string>, port: number): Promise<void> {
+  const log = gatewayLog(env)
   await env.exec(
     [
       'sh',
       '-c',
-      `nohup openclaw gateway --allow-unconfigured --force >${GATEWAY_LOG} 2>&1 </dev/null &`,
+      `nohup openclaw gateway --allow-unconfigured --force >${log} 2>&1 </dev/null &`,
     ],
     // The Gateway, not the bridge, is what calls the model — the API key has to
     // reach *this* process.
@@ -162,13 +184,13 @@ async function startGateway(env: RuntimeEnv, credentialEnv: Record<string, strin
   const { exitCode, stdout, stderr } = await env.exec([
     'sh',
     '-c',
-    `for i in $(seq 1 60); do if ${connectProbe} 2>/dev/null; then exit 0; fi; sleep 1; done; ` +
-      `echo "gateway did not listen on ${OPENCLAW_GATEWAY_PORT} within 60s"; cat ${GATEWAY_LOG}; exit 1`,
+    `for i in $(seq 1 60); do if ${connectProbe(port)} 2>/dev/null; then exit 0; fi; sleep 1; done; ` +
+      `echo "gateway did not listen on ${port} within 60s"; cat ${log}; exit 1`,
   ])
   if (exitCode !== 0) {
     throw new Error(`openclaw gateway failed to start\n${stdout}${stderr}`)
   }
-  progress(`  openclaw gateway ready on :${OPENCLAW_GATEWAY_PORT}`)
+  progress(`  openclaw gateway ready on :${port}`)
 }
 
 /**
@@ -188,6 +210,10 @@ export const openclawAcpxSpec: AcpxSpec = {
   // signal is that file read — the same shape as pi (§5, verified against a real
   // openclaw trace: 1 hit on a design prompt, 0 on an unrelated one).
   skillDetector: skillFileReadDetector,
+  // Forced mode (TODO §P1): same prompt-level inlining as hermes and pi — the one
+  // lever that reaches the model whatever the ACP bridge does. Unit-tested only:
+  // the Gateway needs ~850MB, more than the dev host this was written on has.
+  forceSkill: inlineSkillPrompt,
   /**
    * When acpx fails, say whether the Gateway is still alive and show its log.
    *
@@ -198,25 +224,23 @@ export const openclawAcpxSpec: AcpxSpec = {
    * abrupt end mid-request is what makes that recognisable.
    */
   async diagnose({ env }): Promise<string | undefined> {
+    const port = gatewayPorts.get(env.agentHome) ?? OPENCLAW_GATEWAY_PORT
+    const log = gatewayLog(env)
     const { stdout } = await env.exec([
       'sh',
       '-c',
-      `if ${connectProbe} 2>/dev/null; then echo "gateway: listening"; else ` +
-        `echo "gateway: NOT listening on ${OPENCLAW_GATEWAY_PORT} — it died during the run."; ` +
+      `if ${connectProbe(port)} 2>/dev/null; then echo "gateway: listening"; else ` +
+        `echo "gateway: NOT listening on ${port} — it died during the run."; ` +
         `echo "The usual cause is the host OOM killer: the Gateway grows to ~850MB RSS,"; ` +
         `echo "and capping V8's heap does not bound it. Give the host ~1.5GB free."; fi; ` +
-        `echo "--- ${GATEWAY_LOG} (tail) ---"; tail -20 ${GATEWAY_LOG} 2>/dev/null`,
+        `echo "--- ${log} (tail) ---"; tail -20 ${log} 2>/dev/null`,
     ])
     return stdout.trim() || undefined
   },
   async init({ env, config, credentialEnv }): Promise<void> {
-    const json = renderOpenclawJson(config)
-    await env.exec(['sh', '-c', `mkdir -p "${env.agentHome}"`])
-    await env.exec([
-      'sh',
-      '-c',
-      `cat > "${join(env.agentHome, 'openclaw.json')}" <<'AGENTFOO_EOF'\n${json}\nAGENTFOO_EOF`,
-    ])
-    await startGateway(env, credentialEnv)
+    const port = await pickGatewayPort(env)
+    gatewayPorts.set(env.agentHome, port)
+    await env.writeFile(join(env.agentHome, 'openclaw.json'), `${renderOpenclawJson(config, port)}\n`)
+    await startGateway(env, credentialEnv, port)
   },
 }

@@ -22,6 +22,12 @@ export interface AgentSpec {
   homeEnvVar: string
   /** Basename of the bundled Dockerfile under `dockers/` for this agent. */
   dockerfile: string
+  /**
+   * How to ask the agent binary its version. Only run under `--local`, where the
+   * binary is whatever the host has installed rather than the Dockerfile's pin —
+   * recorded in `report.json`, never compared or enforced (TODO §P1.5).
+   */
+  versionArgv?: string[]
 }
 
 const REGISTRY = new Map<string, AgentSpec>([
@@ -33,11 +39,13 @@ const REGISTRY = new Map<string, AgentSpec>([
     create: acpxSpecFactory(hermesAcpxSpec),
     homeEnvVar: 'HERMES_HOME',
     dockerfile: 'hermes.Dockerfile',
+    versionArgv: ['hermes', '--version'],
   }],
   ['opencode', {
     create: (opts) => new OpencodeAgent(opts),
     homeEnvVar: 'XDG_CONFIG_HOME',
     dockerfile: 'opencode.Dockerfile',
+    versionArgv: ['opencode', '--version'],
   }],
   // pi & openclaw both ride the acpx adapter, but each has its own Dockerfile:
   // the underlying agents install differently and require different Node bases
@@ -53,11 +61,13 @@ const REGISTRY = new Map<string, AgentSpec>([
     create: acpxSpecFactory(piAcpxSpec),
     homeEnvVar: 'PI_CODING_AGENT_DIR',
     dockerfile: 'pi.Dockerfile',
+    versionArgv: ['pi', '--version'],
   }],
   ['openclaw', {
     create: acpxSpecFactory(openclawAcpxSpec),
     homeEnvVar: 'OPENCLAW_STATE_DIR',
     dockerfile: 'openclaw.Dockerfile',
+    versionArgv: ['openclaw', '--version'],
   }],
 ])
 

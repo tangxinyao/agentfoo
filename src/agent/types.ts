@@ -8,6 +8,11 @@ import type { SkillHandle } from '../skill.js'
  * it small lets agentfoo swap between hermes / opencode / acpx-driven agents
  * (pi, openclaw, …) without touching test-author-facing code.
  */
+export interface RunOptions {
+  /** Per-turn limit in ms. */
+  timeout?: number
+}
+
 export interface Agent {
   /** Path, inside the runtime, that runs use as their working directory. */
   readonly workspacePath: string
@@ -27,8 +32,13 @@ export interface Agent {
   loadSkill(hostPath: string, opts?: { force?: boolean }): Promise<SkillHandle>
   /** Seed initial workspace files. Only callable once per instance (§4). */
   loadWorkspace(hostPath: string): Promise<string>
-  /** One conversation turn; subsequent calls continue the same session (§4). */
-  run(prompt: string): Promise<Trace>
+  /**
+   * One conversation turn; subsequent calls continue the same session (§4).
+   * `timeout` (ms) bounds this turn alone: the agent process is killed and the
+   * call rejects naming the turn, instead of the whole test timing out with a
+   * generic message while the agent keeps running.
+   */
+  run(prompt: string, opts?: RunOptions): Promise<Trace>
   /** Start a fresh session on the next run() without tearing down the env (§4). */
   reset(): void
   teardown(): Promise<void>

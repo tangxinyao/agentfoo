@@ -141,6 +141,10 @@ function fakeEnv(
       execEnvs.push(opts?.env)
       return { stdout: '', stderr: '', exitCode: 0, ...route(argv) }
     },
+    async writeFile(path: string, content: string) {
+      calls.push(['writeFile', path, content])
+      execEnvs.push(undefined as unknown as Record<string, string>)
+    },
     async copyDir() {},
     async readFile() {
       return ''
@@ -163,8 +167,7 @@ describe('openclawAcpxSpec.init', () => {
       passEnv: ['DEEPSEEK_API_KEY'],
     }).init()
 
-    expect(env.calls[0]).toEqual(['sh', '-c', 'mkdir -p "/tmp/agenthome"'])
-    expect(env.calls[1][2]).toContain('cat > "/tmp/agenthome/openclaw.json"')
+    expect(env.calls[1].slice(0, 2)).toEqual(['writeFile', '/tmp/agenthome/openclaw.json'])
     expect(env.calls[1][2]).toContain('"baseUrl": "https://api.deepseek.com"')
   })
 
@@ -368,5 +371,41 @@ describe('parseAcpTrace against a real openclaw stream', () => {
     for (const raw of [openclawTrace, openclawUnrelated]) {
       expect(compactAcpStream(raw)).toBe(raw)
     }
+  })
+})
+
+describe('openclaw gateway port (TODO §P1.5)', () => {
+  it('asks the env for a free port and uses it everywhere, instead of a fixed 18789', async () => {
+    const env = fakeEnv((argv) => (argv[0] === 'node' ? { stdout: '43123\n' } : {}))
+    await boot(env, { model: 'deepseek/deepseek-v4-pro' }).init()
+
+    expect(JSON.parse(env.calls[1][2]).gateway.port).toBe(43123)
+    expect(env.calls[2][2]).toContain('/tmp/agenthome/gateway.log') // per-instance log, not /tmp/openclaw-gateway.log
+    expect(env.calls[3][2]).toContain('connect(43123')
+    expect(env.calls[3][2]).not.toContain(`connect(${OPENCLAW_GATEWAY_PORT}`)
+  })
+
+  it('falls back to the default port when the probe fails', async () => {
+    const env = fakeEnv((argv) => (argv[0] === 'node' ? { exitCode: 1 } : {}))
+    await boot(env).init()
+    expect(JSON.parse(env.calls[1][2]).gateway.port).toBe(OPENCLAW_GATEWAY_PORT)
+  })
+})
+
+describe('openclaw forced skill mode (TODO §P1)', () => {
+  it('inlines SKILL.md ahead of the prompt, with the skill dir', async () => {
+    const { fileURLToPath } = await import('node:url')
+    const dir = fileURLToPath(new URL('../example/skills/frontend-design', import.meta.url))
+    const reply =
+      '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":' +
+      '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}}'
+    const env = fakeEnv((argv) => (argv.includes('--format') ? { stdout: reply } : {}))
+    const agent = boot(env)
+    await agent.loadSkill(dir, { force: true })
+    await agent.run('hello')
+    const sent = env.calls.find((c) => c.includes('--format'))!.at(-1)!
+    expect(sent).toContain('name: frontend-design')
+    expect(sent).toContain('/tmp/agenthome/skills/frontend-design')
+    expect(sent.endsWith('hello')).toBe(true)
   })
 })

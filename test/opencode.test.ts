@@ -74,6 +74,9 @@ function fakeEnv(stdout = ''): RuntimeEnv & { calls: string[][] } {
       calls.push(argv)
       return { stdout, stderr: '', exitCode: 0 }
     },
+    async writeFile(path: string, content: string) {
+      calls.push(['writeFile', path, content])
+    },
     async copyDir() {},
     async readFile() {
       return ''

@@ -1,13 +1,13 @@
 import { join } from 'node:path'
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
-import type { Agent, AgentBootOptions } from './types.js'
+import type { Agent, AgentBootOptions, RunOptions } from './types.js'
 import { parseOpenAiChatTrace } from '../trace.js'
 import { resolveModelProvider } from './hermes.js'
 import { SkillHandle } from '../skill.js'
 import type { SkillDetector } from '../skill.js'
 import { preview, progress, withHeartbeat } from '../progress.js'
-import { collectCredentials, readSkillName } from './shared.js'
+import { collectCredentials, readSkillName, turnTimedOut } from './shared.js'
 import { registerAgent } from './registry.js'
 
 /**
@@ -175,7 +175,7 @@ export class CommandAgent implements Agent {
     return this.env.workspacePath
   }
 
-  async run(prompt: string): Promise<Trace> {
+  async run(prompt: string, opts: RunOptions = {}): Promise<Trace> {
     const test = this.currentTest?.()
     if (test !== this.sessionTest) {
       this.reset()
@@ -194,10 +194,11 @@ export class CommandAgent implements Agent {
       agentHome: this.env.agentHome,
       skillsPath: this.env.skillsPath,
     })
-    const { stdout, stderr, exitCode } = await withHeartbeat(
+    const { stdout, stderr, exitCode, timedOut } = await withHeartbeat(
       `${argv[0] ?? 'command'} run: "${preview(prompt)}"`,
-      () => this.env.exec(argv, { env: this.credentialEnv }),
+      () => this.env.exec(argv, { env: this.credentialEnv, timeoutMs: opts.timeout }),
     )
+    if (timedOut) throw turnTimedOut(argv[0] ?? 'command', prompt, opts.timeout!, stderr || stdout)
     if (exitCode !== 0) {
       throw new Error(`${argv[0] ?? 'command'} exited ${exitCode}\n${stderr || stdout}`)
     }

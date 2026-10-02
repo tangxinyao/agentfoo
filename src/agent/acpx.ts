@@ -1,13 +1,14 @@
 import { join } from 'node:path'
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
-import type { Agent, AgentBootOptions } from './types.js'
+import type { Agent, AgentBootOptions, RunOptions } from './types.js'
 import { compactAcpStream, parseAcpTrace } from '../trace.js'
 import { SkillHandle } from '../skill.js'
 import type { SkillDetector } from '../skill.js'
 import { preview, progress, withHeartbeat } from '../progress.js'
-import { collectCredentials, readSkillBody, readSkillName } from './shared.js'
+import { collectCredentials, readSkillBody, readSkillName, turnTimedOut } from './shared.js'
 import { resolveModelProvider } from './hermes.js'
+import { probeProvider } from './provider-probe.js'
 
 /**
  * acpx version pinned into `dockers/{hermes,pi,openclaw}.Dockerfile` — kept as
@@ -94,12 +95,13 @@ export interface AcpxSpec {
   /**
    * Force this agent to receive a skill's content deterministically, skipping
    * its own discovery step (forced mode, TODO §P1). Given the skill's name,
-   * its SKILL.md body (frontmatter included), and the prompt about to be sent,
-   * return the prompt actually sent to the agent. Leave unset to make
+   * its SKILL.md body (frontmatter included), where the skill was copied inside
+   * the runtime, and the prompt about to be sent, return the prompt actually
+   * sent to the agent. Leave unset to make
    * `loadSkill(dir, { force: true })` throw for this agent — most adapters
    * have no verified forcing lever yet.
    */
-  forceSkill?(ctx: { skillName: string; skillBody: string; prompt: string }): string
+  forceSkill?(ctx: { skillName: string; skillBody: string; skillDir: string; prompt: string }): string
   /**
    * Extra context to append when an acpx invocation fails. acpx reports only
    * what it saw over the wire, which for an agent that is really a *bridge* to
@@ -185,6 +187,8 @@ export class AcpxAgent implements Agent {
   private acpxPrefixPromise?: Promise<string[]>
   /** Skills loaded with `{ force: true }` (TODO §P1), reinjected into every prompt. */
   private readonly forcedSkills: { name: string; body: string }[] = []
+  /** Names in {@link forcedSkills}, so a per-test fixture re-loading the same skill doesn't stack N copies into the Nth test's prompt. */
+  private readonly forcedNames = new Set<string>()
   readonly traces: Trace[] = []
 
   /** `--cwd` / home dir actually used by the next exec. Equal to the boot-time env's own paths unless {@link AcpxSpec.isolatePerTest} has provisioned a per-test pair (§P0). */
@@ -236,7 +240,10 @@ export class AcpxAgent implements Agent {
             "the agent's own discovery instead.",
         )
       }
-      this.forcedSkills.push({ name, body: await readSkillBody(hostPath) })
+      if (!this.forcedNames.has(name)) {
+        this.forcedSkills.push({ name, body: await readSkillBody(hostPath) })
+        this.forcedNames.add(name)
+      }
     }
     return new SkillHandle(name, hostPath, () => this.traces, this.spec.skillDetector, forced)
   }
@@ -259,14 +266,15 @@ export class AcpxAgent implements Agent {
     return this.env.workspacePath
   }
 
-  async run(prompt: string): Promise<Trace> {
+  async run(prompt: string, opts: RunOptions = {}): Promise<Trace> {
     await this.ensureSession()
     const effectivePrompt = this.applyForcedSkills(prompt)
     const argv = await this.buildRunArgv(effectivePrompt)
-    const { stdout, stderr, exitCode } = await withHeartbeat(
+    const { stdout, stderr, exitCode, timedOut } = await withHeartbeat(
       `acpx ${this.label} run: "${preview(prompt)}"`,
-      () => this.env.exec(argv, { env: this.execEnv() }),
+      () => this.env.exec(argv, { env: this.execEnv(), timeoutMs: opts.timeout }),
     )
+    if (timedOut) throw turnTimedOut(`acpx ${this.label}`, prompt, opts.timeout!, stderr || stdout)
     if (exitCode !== 0) {
       throw new Error(await this.failure(`exited ${exitCode}`, stderr || stdout))
     }
@@ -288,7 +296,8 @@ export class AcpxAgent implements Agent {
     this.traces.push(trace)
     this.onTrace?.({ trace, sessionJsonl: session })
     if (isSilentTurn(trace)) {
-      throw new Error(await this.failure('produced no output', silentTurnHint(stderr)))
+      const probe = await probeProvider(this.config, this.credentialEnv)
+      throw new Error(await this.failure('produced no output', `${silentTurnHint(stderr)}\n\n${probe}`))
     }
     return trace
   }
@@ -308,7 +317,12 @@ export class AcpxAgent implements Agent {
   private applyForcedSkills(prompt: string): string {
     let out = prompt
     for (const skill of this.forcedSkills) {
-      out = this.spec.forceSkill!({ skillName: skill.name, skillBody: skill.body, prompt: out })
+      out = this.spec.forceSkill!({
+        skillName: skill.name,
+        skillBody: skill.body,
+        skillDir: join(this.currentSkillsPath(), skill.name),
+        prompt: out,
+      })
     }
     return out
   }
@@ -394,6 +408,7 @@ export class AcpxAgent implements Agent {
       exec: (argv, opts) => env.exec(argv, opts),
       copyDir: (hostSrc, dest) => env.copyDir(hostSrc, dest),
       readFile: (path) => env.readFile(path),
+      writeFile: (path, content) => env.writeFile(path, content),
       teardown: () => env.teardown(),
     }
   }

@@ -126,3 +126,44 @@ describe('LocalRuntime teardown (TODO §P1.5 #2)', () => {
     await expect(env.teardown()).resolves.toBeUndefined()
   })
 })
+
+describe('LocalRuntime writeFile (TODO §P3 heredoc)', () => {
+  it('writes content byte-for-byte, creating parent dirs, whatever it contains', async () => {
+    const env = await bootEnv('wf')
+    // Everything the old heredoc writes choked on: its own delimiter, `$VAR`s,
+    // quotes, backslashes, a missing trailing newline.
+    const nasty = `AGENTFOO_EOF\napiKey: "\${DEEPSEEK_API_KEY}" $HOME 'single' \\n \`tick\``
+    const path = `${env.agentHome}/nested/dir/config.yaml`
+    try {
+      await env.writeFile(path, nasty)
+      expect(await env.readFile(path)).toBe(nasty)
+    } finally {
+      await env.teardown()
+    }
+  })
+})
+
+describe('LocalRuntime exec timeout', () => {
+  it('kills the whole process group and reports timedOut', async () => {
+    const env = await bootEnv('to')
+    try {
+      const started = Date.now()
+      const r = await env.exec(['sh', '-c', 'sleep 30 & sleep 30'], { timeoutMs: 300 })
+      expect(r.timedOut).toBe(true)
+      expect(Date.now() - started).toBeLessThan(5000)
+    } finally {
+      await env.teardown()
+    }
+  })
+
+  it('leaves a fast command alone', async () => {
+    const env = await bootEnv('to2')
+    try {
+      const r = await env.exec(['sh', '-c', 'echo hi'], { timeoutMs: 5000 })
+      expect(r).toMatchObject({ stdout: 'hi\n', exitCode: 0 })
+      expect(r.timedOut).toBeUndefined()
+    } finally {
+      await env.teardown()
+    }
+  })
+})

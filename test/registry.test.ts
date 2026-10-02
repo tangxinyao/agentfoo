@@ -78,3 +78,14 @@ describe('resolveAgentConfig provider defaulting', () => {
     expect(cfg.passEnv).toBeUndefined()
   })
 })
+
+describe('bundled Dockerfiles', () => {
+  // The registry only names a basename; this is what proves each built-in kind
+  // actually resolves to a file shipped under dockers/ (TODO §P3).
+  it.each(['hermes', 'opencode', 'pi', 'openclaw'])('%s resolves to an existing bundled Dockerfile', async (kind) => {
+    const { bundledDockerfile } = await import('../src/runtime/docker.js')
+    const path = bundledDockerfile(agentSpec(kind).dockerfile)
+    expect(path).toBeDefined()
+    expect(path!.endsWith(`dockers/${kind}.Dockerfile`)).toBe(true)
+  })
+})

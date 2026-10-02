@@ -25,6 +25,9 @@ function fakeEnv(
       calls.push(argv)
       return onExec(argv, opts)
     },
+    async writeFile(path: string, content: string) {
+      calls.push(['writeFile', path, content])
+    },
     async copyDir() {},
     async readFile() {
       return ''

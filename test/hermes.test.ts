@@ -81,6 +81,10 @@ function fakeEnv(
       execEnvs.push(opts?.env)
       return { stdout: '', stderr: '', exitCode: 0, ...route(argv) }
     },
+    async writeFile(path: string, content: string) {
+      calls.push(['writeFile', path, content])
+      execEnvs.push(undefined as unknown as Record<string, string>)
+    },
     async copyDir(hostSrc: string, dest: string) {
       copies.push([hostSrc, dest])
     },
@@ -101,16 +105,14 @@ const oneTurn = (text: string) =>
   `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"content":{"text":${JSON.stringify(text)},"type":"text"},"sessionUpdate":"agent_message_chunk"}}}`
 
 describe('hermesAcpxSpec.init', () => {
-  it('creates HERMES_HOME and writes a config.yaml heredoc into it', async () => {
+  it('writes config.yaml into HERMES_HOME', async () => {
     const env = fakeEnv()
     const agent = boot(env, { model: 'deepseek/deepseek-v4', baseUrl: 'https://api.deepseek.com' })
 
     await agent.init()
 
-    expect(env.calls[0]).toEqual(['sh', '-c', 'mkdir -p "/home/hermes"'])
-    const write = env.calls[1]
-    expect(write[0]).toBe('sh')
-    expect(write[2]).toContain('cat > "/home/hermes/config.yaml"')
+    const write = env.calls[0]
+    expect(write.slice(0, 2)).toEqual(['writeFile', '/home/hermes/config.yaml'])
     expect(write[2]).toContain('default: deepseek-v4')
     expect(write[2]).toContain('provider: deepseek')
     expect(write[2]).toContain('base_url: https://api.deepseek.com')
@@ -127,30 +129,30 @@ describe('AcpxAgent driving hermes (cwd-session model)', () => {
 
     // hermes sets isolatePerTest (TODO §P0), so the first thing any test does
     // is provision itself a fresh --cwd + home before touching acpx at all:
-    // 1st/2nd exec: mkdir the isolated cwd+skills dir, then hermesAcpxSpec.init
-    // re-seeding config.yaml into the isolated home (3rd exec).
+    // 1st exec: mkdir the isolated cwd+skills dir, then hermesAcpxSpec.init
+    // re-seeding config.yaml into the isolated home (a writeFile).
     const isolatedCwd = '/workspace/.agentfoo-tests/t1/ws'
     expect(env.calls[0]).toEqual([
       'sh', '-c', `mkdir -p "${isolatedCwd}" "/workspace/.agentfoo-tests/t1/home/skills"`,
     ])
-    expect(env.calls[2][2]).toContain('cat > "/workspace/.agentfoo-tests/t1/home/config.yaml"')
-    // 4th exec: the acpx host-resolution probe (TODO §P1.5 #3)
-    expect(env.calls[3]).toEqual(['acpx', '--version'])
-    // 5th exec: sessions new for the isolated cwd (via --agent 'hermes acp').
+    expect(env.calls[1].slice(0, 2)).toEqual(['writeFile', '/workspace/.agentfoo-tests/t1/home/config.yaml'])
+    // next: the acpx host-resolution probe (TODO §P1.5 #3)
+    expect(env.calls[2]).toEqual(['acpx', '--version'])
+    // then: sessions new for the isolated cwd (via --agent 'hermes acp').
     // --ttl is short here (TODO §P0/§P1.5): a per-test queue-owner is never
     // reused past this test, so there's no reuse benefit to trade away by
     // letting it die quickly once idle — only the accumulation risk of a
     // teardown() that (real-machine confirmed) can never signal it directly.
-    expect(env.calls[4]).toEqual([
+    expect(env.calls[3]).toEqual([
       'acpx', '--agent', 'hermes acp', '--cwd', isolatedCwd, '--ttl', '30', 'sessions', 'new',
     ])
-    // 6th exec: the prompt turn — cwd-scoped, no -s, no --model (hermes uses config.yaml)
-    expect(env.calls[5]).toEqual([
+    // last: the prompt turn — cwd-scoped, no -s, no --model (hermes uses config.yaml)
+    expect(env.calls[4]).toEqual([
       'acpx', '--agent', 'hermes acp', '--cwd', isolatedCwd, '--ttl', '30',
       '--approve-all', '--format', 'json', 'hello',
     ])
-    expect(env.calls[5]).not.toContain('-s')
-    expect(env.calls[5]).not.toContain('--model')
+    expect(env.calls[4]).not.toContain('-s')
+    expect(env.calls[4]).not.toContain('--model')
     expect(trace.finalMessage).toBe('the answer')
     expect(agent.traces).toHaveLength(1)
   })
