@@ -58,7 +58,7 @@ export function renderConfigYaml(config: AgentConfig): string {
 /**
  * The hermes {@link AcpxSpec}: reached through `acpx --agent 'hermes acp'`, with
  * model/provider/base_url/memory configured via the `config.yaml` written into
- * HERMES_HOME (so `passModelFlag` stays off). Registered as the `hermes` kind in
+ * HERMES_HOME (so no `modelFlag` is set). Registered as the `hermes` kind in
  * {@link file://./registry.ts}.
  */
 export const hermesAcpxSpec: AcpxSpec = {

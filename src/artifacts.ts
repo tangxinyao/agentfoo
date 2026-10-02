@@ -49,7 +49,11 @@ export function recordTestArtifacts(
       2,
     ),
   )
-  writeFileSync(join(dir, 'hermes-session.jsonl'), info.sessionJsonl)
+  // The agent's own stdout, exactly as it came off the CLI — the capture every
+  // envelope fix has been written against. Named neutrally because it is not
+  // hermes-specific: this same file is what pinned opencode's part stream and
+  // pi's ACP frames.
+  writeFileSync(join(dir, 'agent-session.jsonl'), info.sessionJsonl)
 }
 
 export function writeRunReport(report: unknown): string {

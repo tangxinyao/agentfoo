@@ -169,11 +169,13 @@ async function imageExists(tag: string): Promise<boolean> {
 }
 
 async function buildImage(tag: string, dockerfile: string, context: string): Promise<string> {
-  // First run only: this clones/builds hermes and can take several minutes. The
-  // `docker build` output streams below (inheritStdio) so the wait is visible.
-  progress(`building hermes image ${tag} (first run — this can take a few minutes)`)
+  // First run only: this installs/builds the agent and can take several minutes.
+  // The `docker build` output streams below (inheritStdio) so the wait is visible.
+  // The tag already names the agent, so this line stays neutral — saying "hermes"
+  // here dated from the single-agent era and mislabelled every other build.
+  progress(`building image ${tag} (first run — this can take a few minutes)`)
   await runDocker(['build', '-f', dockerfile, '-t', tag, context], { inheritStdio: true })
-  progress(`built hermes image ${tag}`)
+  progress(`built image ${tag}`)
   return tag
 }
 

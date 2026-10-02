@@ -61,6 +61,14 @@ type StreamEvent =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
   | { type: 'tool-call'; id?: string; name: string; arguments: unknown }
+  /**
+   * Late-arriving arguments for a tool call already emitted. Agents that stream
+   * a tool's input token-by-token announce the call before its arguments exist
+   * (pi: `tool_call` carries `rawInput: {}`, and the path materializes across
+   * later frames), so the call's arguments have to be filled in retroactively
+   * rather than emitted as a second call.
+   */
+  | { type: 'tool-args'; id?: string; arguments: Record<string, unknown> }
   | { type: 'tool-result'; id?: string; content: unknown }
   | { type: 'turn-end' }
 
@@ -94,6 +102,10 @@ function reduceEventStream(
   let text = ''
   let reasoning = ''
   let toolCalls: unknown[] = []
+  // Argument objects of already-emitted calls, by id, so a `tool-args` event can
+  // merge into one after its message was flushed. Safe because these objects are
+  // pushed by reference and only read once the whole stream has been reduced.
+  const argsById = new Map<string, Record<string, unknown>>()
 
   const flush = () => {
     if (!text.trim() && !reasoning.trim() && toolCalls.length === 0) return
@@ -126,12 +138,19 @@ function reduceEventStream(
         case 'reasoning':
           reasoning += ev.text
           break
-        case 'tool-call':
-          toolCalls.push({
-            id: ev.id,
-            function: { name: ev.name, arguments: ev.arguments ?? {} },
-          })
+        case 'tool-call': {
+          const args = (ev.arguments ?? {}) as Record<string, unknown>
+          toolCalls.push({ id: ev.id, function: { name: ev.name, arguments: args } })
+          if (ev.id && args && typeof args === 'object') argsById.set(ev.id, args)
           break
+        }
+        case 'tool-args': {
+          const target = ev.id ? argsById.get(ev.id) : undefined
+          // A later frame carries the fuller value (the input is streamed), so it
+          // wins over what the announcing frame had.
+          if (target) Object.assign(target, ev.arguments)
+          break
+        }
         case 'tool-result':
           flush()
           synth.push({ role: 'tool', tool_call_id: ev.id, content: ev.content })
@@ -289,11 +308,30 @@ const acpMapper: StreamMapper = (rec) => {
           type: 'tool-call',
           id,
           name: acpToolName(update),
-          arguments: { title: update.title, kind: update.kind, text: acpText(update.content) },
+          arguments: {
+            title: update.title,
+            kind: update.kind,
+            text: acpText(update.content),
+            ...acpToolInput(update),
+          },
         },
       ]
-    case 'tool_call_update':
-      return [{ type: 'tool-result', id, content: acpText(update.content) }]
+    case 'tool_call_update': {
+      const events: StreamEvent[] = []
+      // Inputs stream in over many frames (pi), so merge whatever this one knows
+      // into the originating call rather than treating it as a result.
+      const input = acpToolInput(update)
+      if (Object.keys(input).length) events.push({ type: 'tool-args', id, arguments: input })
+      // Only a frame that actually carries content is a result. Frames without it
+      // are pure progress (`status`, partial input) — emitting a tool message for
+      // each would bury the transcript: one real pi turn ships 8326 updates, of
+      // which 9 carry content, and the empty ones rendered as 8318 blank `[tool]`
+      // blocks in `text()`, which is what the judge grades.
+      if (update.content != null) {
+        events.push({ type: 'tool-result', id, content: acpText(update.content) })
+      }
+      return events
+    }
     default:
       // available_commands_update, usage_update: ignored. (The former advertises
       // the agent's slash/skill commands — capture it when forced skill
@@ -305,6 +343,79 @@ const acpMapper: StreamMapper = (rec) => {
 /** Parse an acpx `--format json` (ACP NDJSON) stream into a normalized {@link Trace}. */
 export function parseAcpTrace(text: string): Trace {
   return parseEventStream(text, acpMapper, 'acpx --format json (ACP)')
+}
+
+/**
+ * Collapse an ACP stream's superseded partial-input frames — the fix for a
+ * quadratic blowup that makes some agents' stdout unusable to keep.
+ *
+ * An agent that streams a tool's arguments re-sends the **whole accumulated**
+ * `rawInput` on every token rather than a delta, so writing one file costs
+ * O(n²) bytes. Measured on a real pi turn: 103.7MB of stdout, of which 102.2MB
+ * was partial-input frames and **102.2MB of that was a single `write` call**
+ * re-transmitting one HTML file as it was typed. Message and thought chunks are
+ * true deltas and are left alone (1.5MB combined) — this is not general
+ * "shrink the log", it targets exactly the frames that repeat themselves.
+ *
+ * Within a run of consecutive updates for the same `toolCallId` that carry input
+ * but no `content`, only the last is kept. That one is a strict superset: each
+ * frame restates the full input so far, and the completed frame carries only
+ * `content`/`rawOutput` with **no** `rawInput` at all — so the final partial
+ * frame is the sole source of a tool's arguments and must survive.
+ *
+ * Structure-preserving by construction: frames are never reordered or rewritten,
+ * nothing crosses a content frame or another tool's frames, and every distinct
+ * frame *shape* still occurs, so the archived stream stays usable as the probe
+ * artifact it doubles as. The invariant that matters is asserted in the tests —
+ * the compacted stream parses to the same {@link Trace} as the raw one.
+ */
+export function compactAcpStream(text: string): string {
+  const lines = text.split('\n')
+  const out: string[] = []
+  let pendingIdx = -1
+  let pendingId: string | undefined
+
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const id = partialInputToolCallId(line)
+    if (id === undefined) {
+      out.push(line)
+      pendingIdx = -1
+      pendingId = undefined
+      continue
+    }
+    // Same tool still streaming: overwrite the placeholder we already emitted.
+    if (pendingIdx >= 0 && pendingId === id) {
+      out[pendingIdx] = line
+      continue
+    }
+    out.push(line)
+    pendingIdx = out.length - 1
+    pendingId = id
+  }
+  return out.length ? `${out.join('\n')}\n` : ''
+}
+
+/**
+ * The `toolCallId` of a `tool_call_update` that carries input but no content —
+ * i.e. a frame whose only effect is to restate arguments — or undefined for any
+ * other line. An id-less frame is never collapsed: without an id there is no
+ * evidence the next frame supersedes this one.
+ */
+function partialInputToolCallId(line: string): string | undefined {
+  let rec: unknown
+  try {
+    rec = JSON.parse(line)
+  } catch {
+    return undefined
+  }
+  if (!rec || typeof rec !== 'object') return undefined
+  const params = (rec as Record<string, unknown>).params as Record<string, unknown> | undefined
+  const update = params?.update as Record<string, unknown> | undefined
+  if (!update || update.sessionUpdate !== 'tool_call_update') return undefined
+  if (update.content != null) return undefined
+  if (typeof update.toolCallId !== 'string') return undefined
+  return Object.keys(acpToolInput(update)).length ? update.toolCallId : undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +448,23 @@ function acpText(content: unknown): string {
     if (c.content != null) return acpText(c.content)
   }
   return ''
+}
+
+/**
+ * A tool frame's declared input: ACP's `rawInput` plus the `locations` the tool
+ * touches. Both are optional and agent-specific — hermes puts the command in
+ * `content` and leaves `locations` empty, while pi leaves `content` unset and
+ * streams `rawInput`/`locations`. Keeping them on the call's arguments is what
+ * makes "which file did it read" assertable, and is the signal
+ * {@link file://./skill.ts skillFileReadDetector} keys on.
+ */
+function acpToolInput(update: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  const raw = update.rawInput
+  if (raw && typeof raw === 'object' && Object.keys(raw).length) out.rawInput = raw
+  const locations = update.locations
+  if (Array.isArray(locations) && locations.length) out.locations = locations
+  return out
 }
 
 /** Tool name for an ACP tool_call: the machine `kind` (e.g. `execute`), else the title's head. */

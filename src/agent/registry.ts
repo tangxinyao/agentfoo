@@ -1,8 +1,10 @@
 import type { AgentKind } from '../types.js'
 import type { Agent, AgentBootOptions } from './types.js'
 import { OpencodeAgent } from './opencode.js'
-import { acpxAgentFactory, acpxSpecFactory } from './acpx.js'
+import { acpxSpecFactory } from './acpx.js'
 import { hermesAcpxSpec } from './hermes.js'
+import { piAcpxSpec } from './pi.js'
+import { openclawAcpxSpec } from './openclaw.js'
 
 /**
  * Everything the fixture + runtime layers need to boot one agent kind, without
@@ -37,17 +39,24 @@ const REGISTRY = new Map<string, AgentSpec>([
     homeEnvVar: 'XDG_CONFIG_HOME',
     dockerfile: 'opencode.Dockerfile',
   }],
-  // pi & openclaw share the acpx adapter (differing only by the ACP agent name),
-  // but each has its own Dockerfile: the underlying agents install differently
-  // and require different Node bases (openclaw wants Node 24; pi is fine on 22).
+  // pi & openclaw both ride the acpx adapter, but each has its own Dockerfile:
+  // the underlying agents install differently and require different Node bases
+  // (openclaw wants Node 24; pi is fine on 22).
+  //
+  // Neither uses ACPX_HOME as its home var. acpx only *spawns* the agent; it is
+  // the agent itself that reads the provider config and discovers skills, under
+  // its own state dir. Pointing that dir at the isolated home lands both exactly
+  // where the runtime already writes them (`skills/<name>/SKILL.md` is
+  // `RuntimeEnv.skillsPath` unchanged for both), and acpx keeps its own sessions
+  // in the image's ACPX_HOME.
   ['pi', {
-    create: acpxAgentFactory('pi'),
-    homeEnvVar: 'ACPX_HOME',
+    create: acpxSpecFactory(piAcpxSpec),
+    homeEnvVar: 'PI_CODING_AGENT_DIR',
     dockerfile: 'pi.Dockerfile',
   }],
   ['openclaw', {
-    create: acpxAgentFactory('openclaw'),
-    homeEnvVar: 'ACPX_HOME',
+    create: acpxSpecFactory(openclawAcpxSpec),
+    homeEnvVar: 'OPENCLAW_STATE_DIR',
     dockerfile: 'openclaw.Dockerfile',
   }],
 ])

@@ -79,6 +79,42 @@ export const reasoningReferenceDetector: SkillDetector = (trace, skillName) => {
 }
 
 /**
+ * Detector for agents that advertise skills as **descriptions plus a path** and
+ * expect the model to open the file when a task matches — pi is the verified
+ * case (§5). There is no skill tool: pi injects `<skill name= location=>` into
+ * the system prompt, so the firing signal is an ordinary `read` of that
+ * location, which is the row the signal matrix predicted and a real trace
+ * confirmed.
+ *
+ * Two independent pieces of evidence count, because which one is present depends
+ * on how much of the tool frame the agent fills in:
+ *  - **the path** — a tool input naming `<skill>/SKILL.md` (pi streams this into
+ *    `rawInput`/`locations`, captured by `parseAcpTrace`); or
+ *  - **the payload** — a tool result whose frontmatter is this skill's, i.e. a
+ *    `name: <skill>` line, which is how the SKILL.md text arrives back.
+ *
+ * Both are specific to *this* skill's file, so the negative case still
+ * discriminates: an unrelated turn neither reads that path nor gets that
+ * frontmatter back. A bare mention of the skill's name in prose is deliberately
+ * NOT evidence here — pi's system prompt already lists every skill by name, so
+ * treating a mention as a firing would make the positive case near-unfalsifiable.
+ */
+export const skillFileReadDetector: SkillDetector = (trace, skillName) => {
+  const needle = skillName.toLowerCase()
+  // `name: <skill>` as its own frontmatter line, not merely the string somewhere.
+  const frontmatter = new RegExp(`(^|\\n)\\s*name:\\s*${escapeRegExp(needle)}\\s*(\\n|$)`)
+  return trace.toolCalls.filter((call) => {
+    const input = JSON.stringify(call.arguments ?? {}).toLowerCase()
+    if (input.includes(`${needle}/skill.md`)) return true
+    return typeof call.result === 'string' && frontmatter.test(call.result.toLowerCase())
+  })
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
  * Detect whether a given skill was invoked within a trace.
  *
  * ⚠️ §11 PARTIALLY VERIFIED. The acpx/hermes trace *shape* is now pinned (TODO

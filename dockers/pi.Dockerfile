@@ -26,7 +26,14 @@ ENV ACPX_HOME=/tmp/agenthome
 
 # The headless ACP client, installed the official way (npm global).
 # https://acpx.sh/install.html
-ARG ACPX_VERSION=latest
+#
+# Pinned, and pinning is load-bearing rather than hygiene: the image tag is
+# sha256(Dockerfile bytes), so a floating `latest` leaves the file — and the tag
+# — unchanged as upstream moves, and the stale cached image gets reused forever
+# with no signal (TODO §4). That exact bug bit hermes: 0.12.1 is the first
+# release where `--agent <cmd> sessions new` works (§VI.2), and the cached image
+# silently held 0.12.0. 0.12.1 is also the version §VI.4 probed green.
+ARG ACPX_VERSION=0.12.1
 RUN npm install -g acpx@${ACPX_VERSION} \
     && acpx --version
 
@@ -38,6 +45,25 @@ RUN npm install -g acpx@${ACPX_VERSION} \
 # "Coding agent CLI with read, bash, edit, write tools and session management",
 # bin `pi`). NOT @mariozechner/pi — that is pi-pods, an unrelated vLLM-on-GPU
 # deployment tool (TODO §V.6).
-ARG PI_VERSION=latest
+# Pinned for the same reason as ACPX_VERSION above; 0.73.1 is npm `latest` as of
+# 2026-07-26 (published 2026-05-07).
+ARG PI_VERSION=0.73.1
 RUN npm install -g @mariozechner/pi-coding-agent@${PI_VERSION} \
     && pi --version
+
+# The ACP adapter that actually bridges acpx and pi. `acpx pi` does NOT speak to
+# pi directly: it shells out to a separate `pi-acp` package, resolving it with
+# `npx pi-acp@^0.0.31` on first use when it isn't already on PATH. Left implicit
+# that means every cold container reaches npm mid-test and silently takes
+# whatever satisfies the range — so install it here, pinned, for the same reason
+# ACPX_VERSION is pinned. 0.0.32 is npm `latest` as of 2026-07-26 and the version
+# the green end-to-end run used.
+ARG PI_ACP_VERSION=0.0.32
+RUN npm install -g pi-acp@${PI_ACP_VERSION} \
+    && command -v pi-acp
+
+# pi reads its provider config (models.json) and discovers skills under this dir
+# (default ~/.pi/agent). agentfoo overrides it per exec to the isolated agent
+# home; the default here keeps a bare `docker run` of this image consistent with
+# what the suite does.
+ENV PI_CODING_AGENT_DIR=/tmp/agenthome

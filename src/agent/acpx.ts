@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
 import type { Agent, AgentBootOptions } from './types.js'
-import { parseAcpTrace } from '../trace.js'
+import { compactAcpStream, parseAcpTrace } from '../trace.js'
 import { SkillHandle } from '../skill.js'
 import type { SkillDetector } from '../skill.js'
 import { preview, progress, withHeartbeat } from '../progress.js'
@@ -24,13 +24,16 @@ export interface AcpxSpec {
   /** Human label for logs / errors. Defaults to `agent ?? launchCommand`. */
   label?: string
   /**
-   * Pass the resolved model as acpx's top-level `--model <id>` flag on each turn.
-   * Use for agents whose model acpx controls (pi/openclaw). Leave off for agents
-   * configured through their own home file — hermes takes model/provider/base_url
-   * from the `config.yaml` its {@link init} writes, and acpx's generic `--model`
-   * has no place to put a base_url anyway (TODO §V.4).
+   * Value for acpx's top-level `--model <id>` flag on each turn, or undefined to
+   * omit it. acpx forwards the string verbatim, so the accepted spelling is the
+   * underlying agent's own: pi wants `provider/model` because its `models.json`
+   * can shadow a built-in id, whereas an agent with one namespace takes a bare
+   * id ({@link bareModelFlag}). Leave unset for agents configured entirely
+   * through their own home file — hermes takes model/provider/base_url from the
+   * `config.yaml` its {@link init} writes, and acpx's generic `--model` has
+   * nowhere to put a base_url anyway (TODO §V.4).
    */
-  passModelFlag?: boolean
+  modelFlag?(config: AgentConfig): string | undefined
   /**
    * Seed the underlying agent's own home before the first run — e.g. write
    * hermes' `config.yaml` into HERMES_HOME. Runs once per boot, before any
@@ -45,6 +48,16 @@ export interface AcpxSpec {
    * built-in {@link detectSkillInvocations} guess.
    */
   skillDetector?: SkillDetector
+  /**
+   * Extra context to append when an acpx invocation fails. acpx reports only
+   * what it saw over the wire, which for an agent that is really a *bridge* to
+   * a separate daemon is close to useless — openclaw's Gateway dying mid-turn
+   * surfaces as `agent needs reconnect`, naming neither the daemon nor a reason.
+   * This hook lets the spec that started such a process go read its log.
+   * Best-effort: whatever it throws is ignored, so a broken diagnostic can never
+   * mask the failure it was meant to explain.
+   */
+  diagnose?(ctx: { env: RuntimeEnv }): Promise<string | undefined>
 }
 
 /**
@@ -69,9 +82,11 @@ export interface AcpxSpec {
  * The per-turn `--format json` stdout is the ACP `session/update` NDJSON stream
  * {@link parseAcpTrace} normalizes.
  *
- * VERIFY-CLI: only the hermes (`--agent`) route is probe-verified. For pi/openclaw
- * the exact top-level flag positions, `--model` behaviour, and their own
- * provider/base_url wiring are still unconfirmed against a real binary.
+ * All three built-in routes are probe-verified against real binaries: hermes via
+ * `--agent 'hermes acp'`, pi and openclaw as built-in names — including the
+ * top-level flag positions and each agent's own provider wiring. They differ in
+ * `--model`: pi needs it provider-qualified, hermes and openclaw take the model
+ * from their own config file and must not be passed it at all.
  */
 export class AcpxAgent implements Agent {
   private readonly env: RuntimeEnv
@@ -139,13 +154,23 @@ export class AcpxAgent implements Agent {
       () => this.env.exec(argv, { env: this.credentialEnv }),
     )
     if (exitCode !== 0) {
-      throw new Error(`acpx ${this.label} exited ${exitCode}\n${stderr || stdout}`)
+      throw new Error(await this.failure(`exited ${exitCode}`, stderr || stdout))
     }
 
-    const trace = parseAcpTrace(stdout)
+    // Drop superseded partial-input frames before anything else looks at the
+    // stream, so the trace, `trace.raw` and the archived artifact all derive
+    // from the same bytes. An agent that streams tool arguments restates the
+    // whole input per token: one real pi turn wrote 103.7MB of stdout for a
+    // single file (§compactAcpStream). No-op for an agent that doesn't.
+    const session = compactAcpStream(stdout)
+    if (session.length < stdout.length) {
+      progress(`  compacted stream: ${mib(stdout.length)} → ${mib(session.length)}`)
+    }
+
+    const trace = parseAcpTrace(session)
     progress(`  trace: ${trace.messages.length} messages, ${trace.toolCalls.length} tool calls`)
     this.traces.push(trace)
-    this.onTrace?.({ trace, sessionJsonl: stdout })
+    this.onTrace?.({ trace, sessionJsonl: session })
     return trace
   }
 
@@ -170,7 +195,7 @@ export class AcpxAgent implements Agent {
     const argv = [...this.acpxFrame(), 'sessions', 'new']
     const { stdout, stderr, exitCode } = await this.env.exec(argv, { env: this.credentialEnv })
     if (exitCode !== 0) {
-      throw new Error(`acpx ${this.label} sessions new failed (${exitCode})\n${stderr || stdout}`)
+      throw new Error(await this.failure(`sessions new failed (${exitCode})`, stderr || stdout))
     }
     this.sessionTest = test
     this.hasSession = true
@@ -190,16 +215,35 @@ export class AcpxAgent implements Agent {
     return ['acpx', ...globals, ...agentToken]
   }
 
+  /**
+   * Build the message for a failed acpx invocation, enriched with whatever
+   * {@link AcpxSpec.diagnose} can add. The diagnostic is strictly best-effort:
+   * an agent is already failing here, and a second failure while explaining the
+   * first would replace a real error with a spurious one.
+   */
+  private async failure(what: string, output: string): Promise<string> {
+    let extra: string | undefined
+    try {
+      extra = await this.spec.diagnose?.({ env: this.env })
+    } catch {
+      // ignored on purpose — see above
+    }
+    return `acpx ${this.label} ${what}\n${output}${extra ? `\n\n${extra}` : ''}`
+  }
+
   private buildRunArgv(prompt: string): string[] {
     const globals = ['--approve-all', '--format', 'json']
-    if (this.spec.passModelFlag) {
-      const { model } = resolveModelProvider(this.config)
-      if (model) globals.push('--model', model)
-    }
+    const model = this.spec.modelFlag?.(this.config)
+    if (model) globals.push('--model', model)
     const argv = [...this.acpxFrame(globals), prompt]
     if (this.config.extraArgs) argv.push(...this.config.extraArgs)
     return argv
   }
+}
+
+/** Byte count as MiB, for the one progress line that reports a size. */
+function mib(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`
 }
 
 /** Bind an {@link AcpxSpec} into an {@link AgentBootOptions} constructor. */
@@ -207,10 +251,20 @@ export function acpxSpecFactory(spec: AcpxSpec): (opts: AgentBootOptions) => Acp
   return (opts) => new AcpxAgent(spec, opts)
 }
 
+/** The model id with any `provider/` prefix stripped — acpx's plain `--model`. */
+export function bareModelFlag(config: AgentConfig): string | undefined {
+  return resolveModelProvider(config).model
+}
+
 /**
- * Factory for a built-in acpx agent name (pi / openclaw): the model is selected
- * through acpx's top-level `--model` flag, and there is no home-file init.
+ * Factory for a built-in acpx agent name with no provider config of its own: the
+ * model is selected through acpx's top-level `--model` flag and there is no
+ * home-file init. No built-in agent still uses this — both pi and openclaw
+ * outgrew it (`piAcpxSpec`, `openclawAcpxSpec`), because reaching a custom
+ * endpoint needs a `base_url` acpx has no flag for. It stays exported as the
+ * one-liner for a bring-your-own ACP agent that a built-in provider already
+ * covers; anything else wants a full {@link AcpxSpec}.
  */
 export function acpxAgentFactory(acpAgent: string): (opts: AgentBootOptions) => AcpxAgent {
-  return acpxSpecFactory({ agent: acpAgent, label: acpAgent, passModelFlag: true })
+  return acpxSpecFactory({ agent: acpAgent, label: acpAgent, modelFlag: bareModelFlag })
 }

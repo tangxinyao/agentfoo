@@ -15,13 +15,18 @@ describe('agentSpec registry', () => {
     expect(spec.dockerfile).toBe('opencode.Dockerfile')
   })
 
-  it('routes pi and openclaw through the shared acpx home but per-agent Dockerfiles', () => {
+  // Neither acpx-driven agent uses ACPX_HOME: acpx merely spawns the agent, and
+  // it is the agent that reads its provider config and discovers skills under
+  // its own state dir — pi's models.json under PI_CODING_AGENT_DIR, openclaw's
+  // openclaw.json under OPENCLAW_STATE_DIR. Pointing those at the isolated home
+  // is what puts skills at `RuntimeEnv.skillsPath` for free.
+  it('gives pi and openclaw each their own config home', () => {
     const pi = agentSpec('pi')
-    expect(pi.homeEnvVar).toBe('ACPX_HOME')
+    expect(pi.homeEnvVar).toBe('PI_CODING_AGENT_DIR')
     expect(pi.dockerfile).toBe('pi.Dockerfile')
 
     const openclaw = agentSpec('openclaw')
-    expect(openclaw.homeEnvVar).toBe('ACPX_HOME')
+    expect(openclaw.homeEnvVar).toBe('OPENCLAW_STATE_DIR')
     expect(openclaw.dockerfile).toBe('openclaw.Dockerfile')
   })
 

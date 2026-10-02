@@ -17,7 +17,13 @@ export { bootAgent } from './fixtures.js'
 export { selectedAgentKind } from './config-runtime.js'
 export { retry } from './retry.js'
 export { OpencodeAgent } from './agent/opencode.js'
-export { AcpxAgent, acpxAgentFactory, acpxSpecFactory, type AcpxSpec } from './agent/acpx.js'
+export {
+  AcpxAgent,
+  acpxAgentFactory,
+  acpxSpecFactory,
+  bareModelFlag,
+  type AcpxSpec,
+} from './agent/acpx.js'
 export { registerAgent, type AgentSpec } from './agent/registry.js'
 export {
   CommandAgent,
@@ -32,8 +38,20 @@ export type {
   CommandExportContext,
 } from './agent/command.js'
 export { hermesAcpxSpec, resolveModelProvider, renderConfigYaml } from './agent/hermes.js'
+export { piAcpxSpec, renderPiModelsJson, piModelFlag } from './agent/pi.js'
+export {
+  openclawAcpxSpec,
+  renderOpenclawJson,
+  OPENCLAW_GATEWAY_PORT,
+} from './agent/openclaw.js'
 export type { Agent, AgentBootOptions } from './agent/types.js'
-export { SkillHandle, setSkillDetector, detectSkillInvocations, reasoningReferenceDetector } from './skill.js'
+export {
+  SkillHandle,
+  setSkillDetector,
+  detectSkillInvocations,
+  reasoningReferenceDetector,
+  skillFileReadDetector,
+} from './skill.js'
 // Trace parsers are named after the wire envelope they decode, not after an
 // agent: four built-in agents map onto three envelopes (hermes/pi/openclaw all
 // speak ACP), and a bring-your-own CLI may reuse any of them.
@@ -41,6 +59,7 @@ export {
   parseOpenAiChatTrace,
   parseOpencodePartTrace,
   parseAcpTrace,
+  compactAcpStream,
   buildTrace,
   // Deprecated pre-0.2 aliases.
   parseTrace,
