@@ -1,0 +1,23 @@
+name: CI
+
+# Offline gate only — no Docker, no API keys. This covers `test/**/*.test.ts`
+# (the framework's own unit tests against recorded fixtures) plus typecheck.
+# The `example/` suite drives real agent binaries/containers and costs real
+# money; it is intentionally not run here (see TODO.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
