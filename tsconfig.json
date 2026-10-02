@@ -16,5 +16,9 @@
       "agentfoo/config": ["./src/config.ts"]
     }
   },
-  "include": ["src", "example"]
+  // `test` is included deliberately: without it the renames and types this repo
+  // spends effort keeping honest were only checked at runtime, and a stale
+  // property name in a fixture surfaced as a mystery assertion failure instead of
+  // a compile error.
+  "include": ["src", "example", "test"]
 }

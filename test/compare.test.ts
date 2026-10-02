@@ -86,7 +86,7 @@ describe('compareRuns + human preferences', () => {
     try {
       expect(await (await fetch(url)).text()).toContain('agentfoo compare')
       const ok = await fetch(`${url}api/preferences`, { method: 'PUT', body: JSON.stringify({ cases: { c1: { pick: 'b' } } }) })
-      expect((await ok.json()).ok).toBe(true)
+      expect(((await ok.json()) as { ok: boolean }).ok).toBe(true)
       expect(JSON.parse(readFileSync(join(dir, 'preferences.json'), 'utf8')).cases.c1.pick).toBe('b')
       const bad = await fetch(`${url}api/preferences`, { method: 'PUT', body: '{"cases":{"c1":{"pick":"left"}}}' })
       expect(bad.status).toBe(400)

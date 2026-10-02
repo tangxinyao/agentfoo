@@ -53,7 +53,9 @@ describe('retry', () => {
 
   it('preserves the last failure as the error cause', async () => {
     const { fn } = flaky(2, 'ok')
-    const err = await retry(fn, { attempts: 2 }).catch((e) => e as Error & { cause?: unknown })
+    // `catch` widens the result to the promise's own resolved type (a string
+    // here) unioned with the handler's return, so the rejection needs naming.
+    const err = (await retry(fn, { attempts: 2 }).catch((e) => e)) as Error & { cause?: Error }
     expect((err.cause as Error).message).toBe('boom 2')
   })
 })

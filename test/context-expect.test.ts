@@ -19,7 +19,12 @@ describe('matchers on the test-context expect (needed under test.concurrent)', (
 
 describe('vitest’s own predicate toSatisfy keeps working', () => {
   it('on the context expect', ({ expect }) => {
-    expect(4).toSatisfy((n: number) => n % 2 === 0)
-    expect(() => expect(3).toSatisfy((n: number) => n % 2 === 0)).toThrow()
+    // agentfoo's declared matcher type describes the *rubric* form (a criterion
+    // string plus options). vitest's bare-predicate form is deliberately kept
+    // working at runtime — that is what this test pins — so the predicate is
+    // cast: the mismatch is in the declared type, not in the behaviour.
+    const even = ((n: number) => n % 2 === 0) as never
+    expect(4).toSatisfy(even)
+    expect(() => expect(3).toSatisfy(even)).toThrow()
   })
 })
