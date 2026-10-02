@@ -1,9 +1,14 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { join } from 'node:path'
-import { sanitize } from './artifacts.js'
+import { sanitize, readJson, readRunForExport } from './artifacts.js'
+import type { RunReport } from './artifacts.js'
 import { REVIEW_PAGE } from './review-page.js'
+import { SESSION_PAGE } from './session-page.js'
 import { COMPARE_PAGE } from './compare-page.js'
+import { planRunSpans, spanTree } from './otel.js'
+import type { PlannedSpan, RunInput, SpanTree } from './otel.js'
+import { buildWaterfall } from './waterfall.js'
 import { summarize, type CompareResult, type Pick } from './compare.js'
 import type { JudgeRecord } from './types.js'
 
@@ -69,10 +74,10 @@ function testDir(runPath: string, name: string): string {
 
 /** Everything the review page shows about one run. */
 export function loadReviewCases(runPath: string): ReviewCase[] {
-  const report = JSON.parse(readFileSync(join(runPath, 'report.json'), 'utf8')) as {
-    tests?: Array<{ name: string; state: ReviewCase['state']; meta?: Record<string, string> }>
+  const report = readJson<RunReport>(join(runPath, 'report.json'))
+  if (!report?.tests) {
+    throw new Error(`${runPath}/report.json has no per-test entries — rerun with a current agentfoo.`)
   }
-  if (!report.tests) throw new Error(`${runPath}/report.json has no per-test entries — rerun with a current agentfoo.`)
   return report.tests
     .filter((t) => t.state !== 'skip')
     .map((t) => {
@@ -83,21 +88,19 @@ export function loadReviewCases(runPath: string): ReviewCase[] {
       let finalMessage = ''
       const last = turns.at(-1)
       if (last) {
-        try {
-          const trace = JSON.parse(readFileSync(join(dir, last, 'trace.json'), 'utf8')) as {
-            finalMessage?: string
-            messages?: Array<{ role: string; content: string }>
-          }
-          finalMessage = trace.finalMessage ?? ''
-          prompt = trace.messages?.find((m) => m.role === 'user')?.content ?? ''
-        } catch {
-          // shown as empty; the reviewer can still rate and comment
-        }
+        const trace = readJson<{ finalMessage?: string; messages?: Array<{ role: string; content: string }> }>(
+          join(dir, last, 'trace.json'),
+        )
+        // Absent for a turn that produced no parseable envelope; shown as empty
+        // and the reviewer can still rate and comment.
+        finalMessage = trace?.finalMessage ?? ''
+        prompt = trace?.messages?.find((m) => m.role === 'user')?.content ?? ''
       }
       const judges = files
         .filter((f) => /^judge-\d+\.json$/.test(f))
         .sort((a, b) => Number(a.slice(6, -5)) - Number(b.slice(6, -5)))
-        .map((f) => JSON.parse(readFileSync(join(dir, f), 'utf8')) as JudgeRecord)
+        .map((f) => readJson<JudgeRecord>(join(dir, f)))
+        .filter((j): j is JudgeRecord => j !== undefined)
       return { name: t.name, state: t.state, meta: t.meta ?? {}, prompt, finalMessage, judges }
     })
 }
@@ -107,9 +110,8 @@ export function reviewPath(runPath: string): string {
 }
 
 export function loadReview(runPath: string): RunReview {
-  const p = reviewPath(runPath)
-  if (!existsSync(p)) return { run: runPath.split(/[\\/]/).at(-1) ?? '', cases: {} }
-  return JSON.parse(readFileSync(p, 'utf8')) as RunReview
+  const fallback: RunReview = { run: runPath.split(/[\\/]/).at(-1) ?? '', cases: {} }
+  return readJson<RunReview>(reviewPath(runPath)) ?? fallback
 }
 
 /** Reject anything that isn't a well-formed review before it overwrites the file. */
@@ -148,20 +150,74 @@ export function agreement(review: RunReview): { agree: number; disagree: number;
   return { agree, disagree, rate: agree + disagree ? agree / (agree + disagree) : null }
 }
 
+/**
+ * The span subtree for one test, plus the run root so the page shows where the
+ * session sits inside the run.
+ *
+ * Matched by test *name*, never by index: the review page lists only non-skipped
+ * tests, so its indices do not line up with the plan's (which covers every test
+ * `report.json` recorded).
+ */
+function spansForTest(tree: SpanTree, testName: string): PlannedSpan[] {
+  const root = tree.root()
+  const test = tree.testSpan(testName)
+  if (!test) return root ? [root] : []
+  return [...(root ? [root] : []), ...tree.subtree(test.key)]
+}
+
 /** Serve the review page for one run on 127.0.0.1. Resolves once listening. */
 export function serveReview(runPath: string, port: number): Promise<{ server: Server; url: string }> {
   const cases = loadReviewCases(runPath)
   const runId = runPath.split(/[\\/]/).at(-1) ?? ''
+
+  // The OTLP span plan for this run, computed once. The session page renders
+  // exactly this, so the local view and what the exporter ships cannot drift.
+  // Older runs (written before turn artifacts existed) simply yield no spans.
+  let exportInput: RunInput | undefined
+  try {
+    exportInput = readRunForExport(runPath)
+  } catch {
+    exportInput = undefined
+  }
+  const plan = exportInput ? planRunSpans(exportInput) : []
+  const tree = spanTree(plan)
+
   const server = createServer((req, res) => {
     const send = (status: number, body: string, type = 'application/json; charset=utf-8') => {
       res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' })
       res.end(body)
     }
+    const url = req.url ?? ''
     if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
       return send(200, REVIEW_PAGE, 'text/html; charset=utf-8')
     }
     if (req.method === 'GET' && req.url === '/api/run') {
       return send(200, JSON.stringify({ runId, cases, review: loadReview(runPath) }))
+    }
+    // Session detail page + the OTel trace it renders.
+    if (req.method === 'GET' && /^\/session\/\d+$/.test(url)) {
+      return send(200, SESSION_PAGE, 'text/html; charset=utf-8')
+    }
+    const sessionMatch = req.method === 'GET' ? /^\/api\/session\/(\d+)$/.exec(url) : null
+    if (sessionMatch) {
+      const index = Number(sessionMatch[1])
+      const reviewCase = cases[index]
+      if (!reviewCase) return send(404, JSON.stringify({ error: `no session ${index}` }))
+      const spans = spansForTest(tree, reviewCase.name)
+      return send(
+        200,
+        JSON.stringify({
+          run: { runId },
+          agent: exportInput?.agent,
+          case: reviewCase,
+          spans,
+          /** Layout for the waterfall, computed here so the page holds no math. */
+          waterfall: buildWaterfall(spans),
+          siblings: cases
+            .map((c, i) => ({ index: i, name: c.name, state: c.state }))
+            .filter((c) => c.name !== reviewCase.name),
+        }),
+      )
     }
     if (req.method === 'PUT' && req.url === '/api/review') {
       let body = ''

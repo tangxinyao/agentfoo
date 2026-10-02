@@ -269,10 +269,14 @@ function renderCase() {
   comment.value = r.comment || ''
   comment.addEventListener('input', () => { r.comment = comment.value; r.reviewedAt = new Date().toISOString(); scheduleSave() })
 
+  const caseIndex = data.cases.findIndex((x) => x.name === current)
   main.append(
     h('div', { class: 'case-head' },
       h('h2', {}, c.name),
       h('span', { class: 'badge ' + c.state }, c.state === 'pass' ? 'passed' : 'failed'),
+      // The session detail page renders this session's OTel trace (§9 → protocol)
+      // from the same span plan the OTLP exporter ships.
+      h('a', { class: 'chip', href: '/session/' + caseIndex, style: 'text-decoration:none' }, 'OTel trace →'),
       Object.entries(c.meta).map(([k, v]) => h('span', { class: 'chip' }, k + ': ' + v))),
     h('div', { class: 'grid' },
       h('div', {},

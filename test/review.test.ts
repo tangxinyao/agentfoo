@@ -11,6 +11,7 @@ import {
   type RunReview,
 } from '../src/review.js'
 import { REVIEW_PAGE } from '../src/review-page.js'
+import { SESSION_PAGE } from '../src/session-page.js'
 import { effectiveState, loadEvidence } from '../src/suggest.js'
 import type { JudgeRecord } from '../src/types.js'
 
@@ -37,6 +38,18 @@ function writeCase(name: string, met: boolean[]) {
   writeFileSync(
     join(dir, 'turn-2', 'trace.json'),
     JSON.stringify({ finalMessage: `answer to ${name}`, messages: [{ role: 'user', content: `prompt for ${name}` }] }),
+  )
+  // Turn timing is what the OTel trace is built from, so the session page has
+  // something to render (this is also where `tool_ms` and the stalls come from).
+  writeFileSync(
+    join(dir, 'turn-2', 'timing.json'),
+    JSON.stringify({
+      totalMs: 12_000,
+      firstFrameMs: 2_000,
+      frames: { seen: 40, retained: 40, truncated: 0 },
+      split: { agentMs: 5_000, toolMs: 7_000, quality: 'exact' },
+      longest: [{ tMs: 2_000, gapMs: 2_000, after: 'exec_start' }],
+    }),
   )
   writeFileSync(join(dir, 'judge-1.json'), JSON.stringify(judge(name, met)))
 }
@@ -100,6 +113,66 @@ describe('review server', () => {
 
   it('ships a page whose script at least parses', () => {
     const script = REVIEW_PAGE.match(/<script>([\s\S]*)<\/script>/)![1]
+    expect(() => new Function(script)).not.toThrow()
+  })
+})
+
+describe('session detail page', () => {
+  it('serves the page and the OTel trace for one session, with its run parent', async () => {
+    const { server, url } = await serveReview(runPath, 0)
+    try {
+      const html = await (await fetch(`${url}session/0`)).text()
+      expect(html).toContain('agentfoo session')
+      expect(html).toContain('OTel trace')
+
+      const data = (await (await fetch(`${url}api/session/0`)).json()) as {
+        case: { name: string; state: string }
+        spans: Array<{
+          key: string
+          name: string
+          attributes: Record<string, unknown>
+          events: Array<{ name: string }>
+        }>
+        waterfall: { rows: Array<{ kind: string; depth: number }>; spanCount: number }
+        siblings: Array<{ index: number; name: string }>
+      }
+      expect(data.case.name).toBe('[test/article] burn')
+      expect(data.siblings).toEqual([{ index: 1, name: '[train/article] sky', state: 'pass' }])
+      // The run span comes along so the page can show where the session sits.
+      expect(data.spans.map((s) => s.key)).toEqual(['run', 'test:0', 'test:0:turn:2'])
+      // Layout for the page is computed server-side (src/waterfall.ts).
+      expect(data.waterfall.rows.map((r) => r.kind)).toEqual(['run', 'test', 'turn'])
+      expect(data.waterfall.rows.map((r) => r.depth)).toEqual([0, 1, 2])
+      expect(data.waterfall.spanCount).toBe(3)
+
+      const turn = data.spans[2]
+      expect(turn.attributes['agentfoo.tool_ms']).toBe(7_000)
+      expect(turn.attributes['agentfoo.split_quality']).toBe('exact')
+      expect(turn.events.map((e) => e.name)).toEqual(['agentfoo.stall'])
+    } finally {
+      server.close()
+    }
+  })
+
+  it('only serves the requested session, and 404s an index that does not exist', async () => {
+    const { server, url } = await serveReview(runPath, 0)
+    try {
+      const second = (await (await fetch(`${url}api/session/1`)).json()) as {
+        case: { name: string }
+        spans: Array<{ key: string }>
+      }
+      expect(second.case.name).toBe('[train/article] sky')
+      expect(second.spans.map((s) => s.key)).toEqual(['run', 'test:1', 'test:1:turn:2'])
+
+      const missing = await fetch(`${url}api/session/9`)
+      expect(missing.status).toBe(404)
+    } finally {
+      server.close()
+    }
+  })
+
+  it('ships a session page whose script at least parses', () => {
+    const script = SESSION_PAGE.match(/<script>([\s\S]*)<\/script>/)![1]
     expect(() => new Function(script)).not.toThrow()
   })
 })
