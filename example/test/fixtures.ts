@@ -1,53 +1,20 @@
 import { fileURLToPath } from 'node:url'
-import { test as base, bootAgent, setSkillDetector } from 'agentfoo'
-import type { Agent, SkillHandle, ToolCall, Trace } from 'agentfoo'
+import { test as base, bootAgent } from 'agentfoo'
+import type { Agent, SkillHandle } from 'agentfoo'
 
 /**
  * Project-level shared fixtures (§4). The vitest `test.extend()` mechanism does
  * setup/teardown, lifecycle scoping, and lazy dependency resolution for us.
+ *
+ * No `setSkillDetector` here on purpose. These specs used to pin hermes' signal
+ * globally — hermes preloads skills into its system prompt, so a firing is not a
+ * tool call, only a by-name mention in the model's reasoning. That override is
+ * now the hermes adapter's own default (`reasoningReferenceDetector`), because
+ * `setSkillDetector` is a single per-worker slot: running the same specs against
+ * another agent via `-a` would have graded them with hermes' signal, and
+ * opencode's real `skill({name})` tool call would have gone silently undetected
+ * (TODO §5).
  */
-
-/**
- * Pin the §11 skill-invocation signal to what hermes' real traces actually show.
- *
- * The built-in `detectSkillInvocations` heuristic looks for a `skill_*` tool
- * call — but hermes *preloads* skills into its system prompt, so activating one
- * is NOT a tool call. Observed against a real DeepSeek run: the only tool call on
- * a design turn is `write_file`; the genuine signal that the preloaded skill drove
- * the turn is the model naming it in its reasoning ("load the frontend-design
- * skill…", "avoids the defaults the frontend-design skill mentions"). The
- * unrelated (weather) turn never names it. So we treat a by-name reference in a
- * turn's reasoning as the invocation and surface it as a synthetic marker call,
- * which is what `toHaveBeenCalled` counts.
- *
- * Reasoning reaches us via `TraceMessage.reasoning`, which both parsers populate
- * (hermes `reasoning`/`reasoning_content`; ACP `agent_thought_chunk`).
- *
- * This runs inside each vitest worker (registered from a `setupFiles` module).
- *
- * ⚠ This detector is hermes-shaped. `setSkillDetector` is a single per-worker slot,
- * so running these specs against another agent via `-a` will grade them with the
- * wrong signal — opencode fires a real `skill({name})` tool call and never names
- * the skill in reasoning, so `toHaveBeenCalled` would go silently false. Making
- * detection per-agent is TODO §5; do it before adding a second agent here.
- */
-setSkillDetector((trace: Trace, skillName: string): ToolCall[] => {
-  const needle = skillName.toLowerCase()
-  const calls: ToolCall[] = []
-  for (const msg of trace.messages) {
-    const evidence = [msg.reasoning, msg.content]
-      .filter((s): s is string => typeof s === 'string')
-      .find((s) => s.toLowerCase().includes(needle))
-    if (evidence) {
-      calls.push({
-        name: `skill:${skillName}`,
-        arguments: { via: 'reasoning-reference', name: skillName },
-        result: evidence.slice(0, 200),
-      })
-    }
-  }
-  return calls
-})
 
 const frontendDesignDir = fileURLToPath(
   new URL('../skills/frontend-design', import.meta.url),

@@ -2,9 +2,10 @@ import { join } from 'node:path'
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
 import type { Agent, AgentBootOptions } from './types.js'
-import { parseTrace } from '../trace.js'
+import { parseOpenAiChatTrace } from '../trace.js'
 import { resolveModelProvider } from './hermes.js'
 import { SkillHandle } from '../skill.js'
+import type { SkillDetector } from '../skill.js'
 import { preview, progress, withHeartbeat } from '../progress.js'
 import { collectCredentials, readSkillName } from './shared.js'
 import { registerAgent } from './registry.js'
@@ -70,8 +71,8 @@ export interface CommandAgentDef {
   run(ctx: CommandRunContext): string[]
   /**
    * Parse the run's stdout into a normalized {@link Trace}. Defaults to
-   * {@link parseTrace} (OpenAI-shaped jsonl); pass {@link parseOpencodeTrace} /
-   * {@link parseAcpxTrace} or your own for a different envelope.
+   * {@link parseOpenAiChatTrace} (OpenAI-shaped jsonl); pass {@link parseOpencodePartTrace} /
+   * {@link parseAcpTrace} or your own for a different envelope.
    */
   parse?(stdout: string): Trace
   /** Optional setup before the first run — e.g. write a config file into the home. */
@@ -85,6 +86,15 @@ export interface CommandAgentDef {
    * is parsed directly.
    */
   exportTrace?(ctx: CommandExportContext): Promise<string>
+  /**
+   * Optional: this CLI's skill-firing signal (§5), used by
+   * `expect(skill).toHaveBeenCalled()`. The signal is per-agent — a native
+   * `skill({name})` tool call, a file read of the skill's path, or (for agents
+   * that preload skills into the system prompt) only a by-name mention in
+   * reasoning, for which agentfoo ships {@link reasoningReferenceDetector}.
+   * Omit to use the built-in {@link detectSkillInvocations} guess.
+   */
+  skillDetector?: SkillDetector
 }
 
 /**
@@ -144,7 +154,7 @@ export class CommandAgent implements Agent {
       await this.env.copyDir(hostPath, join(this.env.skillsPath, name))
       this.loadedSkills.add(name)
     }
-    return new SkillHandle(name, hostPath, () => this.traces)
+    return new SkillHandle(name, hostPath, () => this.traces, this.def.skillDetector)
   }
 
   async loadWorkspace(hostPath: string): Promise<string> {
@@ -197,7 +207,7 @@ export class CommandAgent implements Agent {
           credentialEnv: this.credentialEnv,
         })
       : stdout
-    const trace = (this.def.parse ?? parseTrace)(jsonl)
+    const trace = (this.def.parse ?? parseOpenAiChatTrace)(jsonl)
     progress(`  trace: ${trace.messages.length} messages, ${trace.toolCalls.length} tool calls`)
     this.traces.push(trace)
     this.onTrace?.({ trace, sessionJsonl: jsonl })
@@ -251,7 +261,7 @@ export interface CommandAgentRegistration extends CommandAgentDef {
  *     ...(sessionId ? ['--resume', sessionId] : []),
  *   ],
  *   extractSessionId: (out) => out.match(/session:\s*(\S+)/)?.[1],
- *   // parse defaults to parseTrace (OpenAI-shaped jsonl)
+ *   // parse defaults to parseOpenAiChatTrace (OpenAI-shaped jsonl)
  * })
  * ```
  *

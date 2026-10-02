@@ -55,7 +55,7 @@ describe('CommandAgent', () => {
 
     // provider prefix stripped for the bare `-m` value, like the built-in adapters
     expect(env.calls[0]).toEqual(['mycli', 'chat', 'hello', '-m', 'deepseek-v4'])
-    // default parser is parseTrace → OpenAI-shaped jsonl
+    // default parser is parseOpenAiChatTrace → OpenAI-shaped jsonl
     expect(trace.finalMessage).toBe('hi there')
     expect(agent.traces).toHaveLength(1)
   })

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Capture the raw acpx --format json envelope for a TOOL-USING turn, so the trace
-# parser (parseAcpxTrace) and skill-detection (§11) can be pinned to real shapes.
+# parser (parseAcpTrace) and skill-detection (§11) can be pinned to real shapes.
 set -uo pipefail
 export HERMES_HOME=/tmp/hh; mkdir -p "$HERMES_HOME"
 cat > "$HERMES_HOME/config.yaml" <<YAML

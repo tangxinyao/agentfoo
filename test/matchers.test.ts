@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
 // Importing agentfoo registers the custom matchers as a side effect.
 import 'agentfoo'
-import { parseTrace } from '../src/trace.js'
+import { parseOpenAiChatTrace } from '../src/trace.js'
 import { SkillHandle } from '../src/skill.js'
 
 function trace(name: string) {
@@ -11,7 +11,7 @@ function trace(name: string) {
     fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)),
     'utf8',
   )
-  return parseTrace(jsonl)
+  return parseOpenAiChatTrace(jsonl)
 }
 
 function handleFor(fixtureName: string): SkillHandle {

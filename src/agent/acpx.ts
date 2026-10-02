@@ -2,8 +2,9 @@ import { join } from 'node:path'
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
 import type { Agent, AgentBootOptions } from './types.js'
-import { parseAcpxTrace } from '../trace.js'
+import { parseAcpTrace } from '../trace.js'
 import { SkillHandle } from '../skill.js'
+import type { SkillDetector } from '../skill.js'
 import { preview, progress, withHeartbeat } from '../progress.js'
 import { collectCredentials, readSkillName } from './shared.js'
 import { resolveModelProvider } from './hermes.js'
@@ -36,6 +37,14 @@ export interface AcpxSpec {
    * session is created.
    */
   init?(ctx: { env: RuntimeEnv; config: AgentConfig; credentialEnv: Record<string, string> }): Promise<void>
+  /**
+   * This agent's skill-firing signal (§5). ACP normalizes the *transport*, not
+   * what a skill activation looks like: hermes preloads skills and only names
+   * them in reasoning ({@link reasoningReferenceDetector}), while an agent with
+   * a native skill tool surfaces a real tool call. Leave unset to use the
+   * built-in {@link detectSkillInvocations} guess.
+   */
+  skillDetector?: SkillDetector
 }
 
 /**
@@ -58,7 +67,7 @@ export interface AcpxSpec {
  * ```
  *
  * The per-turn `--format json` stdout is the ACP `session/update` NDJSON stream
- * {@link parseAcpxTrace} normalizes.
+ * {@link parseAcpTrace} normalizes.
  *
  * VERIFY-CLI: only the hermes (`--agent`) route is probe-verified. For pi/openclaw
  * the exact top-level flag positions, `--model` behaviour, and their own
@@ -108,7 +117,7 @@ export class AcpxAgent implements Agent {
       await this.env.copyDir(hostPath, join(this.env.skillsPath, name))
       this.loadedSkills.add(name)
     }
-    return new SkillHandle(name, hostPath, () => this.traces)
+    return new SkillHandle(name, hostPath, () => this.traces, this.spec.skillDetector)
   }
 
   async loadWorkspace(hostPath: string): Promise<string> {
@@ -133,7 +142,7 @@ export class AcpxAgent implements Agent {
       throw new Error(`acpx ${this.label} exited ${exitCode}\n${stderr || stdout}`)
     }
 
-    const trace = parseAcpxTrace(stdout)
+    const trace = parseAcpTrace(stdout)
     progress(`  trace: ${trace.messages.length} messages, ${trace.toolCalls.length} tool calls`)
     this.traces.push(trace)
     this.onTrace?.({ trace, sessionJsonl: stdout })

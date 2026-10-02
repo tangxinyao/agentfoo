@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import type { AgentConfig } from '../types.js'
 import type { AcpxSpec } from './acpx.js'
+import { reasoningReferenceDetector } from '../skill.js'
 
 /**
  * hermes-agent (NousResearch) driven through the acpx ACP client, NOT its own
@@ -63,6 +64,12 @@ export function renderConfigYaml(config: AgentConfig): string {
 export const hermesAcpxSpec: AcpxSpec = {
   launchCommand: 'hermes acp',
   label: 'hermes',
+  // hermes preloads skills into its system prompt, so a skill firing is not a
+  // tool call at all — the signal is the model naming it in reasoning (§5,
+  // verified against real traces). This was previously pinned per-suite via
+  // `setSkillDetector`, which is a per-worker global and would have mis-graded
+  // any second agent booted alongside hermes.
+  skillDetector: reasoningReferenceDetector,
   async init({ env, config }): Promise<void> {
     const yaml = renderConfigYaml(config)
     await env.exec(['sh', '-c', `mkdir -p "${env.agentHome}"`])

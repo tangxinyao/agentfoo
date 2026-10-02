@@ -1,16 +1,32 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, it, expect } from 'vitest'
-import { parseTrace } from '../src/trace.js'
-import { SkillHandle, detectSkillInvocations, setSkillDetector } from '../src/skill.js'
+import { parseOpenAiChatTrace } from '../src/trace.js'
+import {
+  SkillHandle,
+  detectSkillInvocations,
+  reasoningReferenceDetector,
+  setSkillDetector,
+} from '../src/skill.js'
 import type { Trace } from '../src/types.js'
+
+/** A minimal trace carrying only reasoning — the hermes-shaped signal (§5). */
+function reasoningTrace(reasoning: string): Trace {
+  return {
+    messages: [{ role: 'assistant', content: '', reasoning }],
+    toolCalls: [],
+    finalMessage: '',
+    raw: [],
+    text: () => '',
+  }
+}
 
 function trace(name: string) {
   const jsonl = readFileSync(
     fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)),
     'utf8',
   )
-  return parseTrace(jsonl)
+  return parseOpenAiChatTrace(jsonl)
 }
 
 describe('detectSkillInvocations (§11 heuristic)', () => {
@@ -65,5 +81,66 @@ describe('setSkillDetector', () => {
     expect(handle.calls()).toHaveLength(0)
     setSkillDetector((t) => t.toolCalls)
     expect(handle.calls()).toEqual(traces[0].toolCalls)
+  })
+
+  it('outranks the adapter default, so the global escape hatch still wins', () => {
+    const traces: Trace[] = []
+    const handle = new SkillHandle('frontend-design', '/skills/fd', () => traces, () => [])
+    traces.push(trace('frontend-design-triggered.jsonl'))
+    // Adapter default says "never fires"…
+    expect(handle.calls()).toHaveLength(0)
+    // …until a suite overrides detection globally.
+    setSkillDetector(detectSkillInvocations)
+    expect(handle.calls()).toHaveLength(1)
+  })
+})
+
+/**
+ * §5: detection is per-agent, not one global guess — the signal differs by agent
+ * (opencode fires a real `skill({name})` tool call; hermes preloads skills and
+ * only names them in reasoning). Adapters therefore pass their own detector into
+ * the handle, so a suite booting two agents grades each with its own signal.
+ */
+describe('per-agent detector', () => {
+  afterEach(() => setSkillDetector(undefined))
+
+  it('is used in place of the built-in guess', () => {
+    const traces: Trace[] = []
+    const handle = new SkillHandle('frontend-design', '/skills/fd', () => traces, reasoningReferenceDetector)
+    traces.push(reasoningTrace('Let me load the frontend-design skill first.'))
+    // The built-in heuristic sees no tool call at all here, so a hit proves the
+    // adapter's detector ran.
+    expect(detectSkillInvocations(traces[0], 'frontend-design')).toHaveLength(0)
+    expect(handle.calls()).toHaveLength(1)
+    expect(handle.calls()[0].name).toBe('skill:frontend-design')
+  })
+
+  it('leaves the built-in guess in place when an adapter ships none', () => {
+    const traces: Trace[] = []
+    const handle = new SkillHandle('frontend-design', '/skills/fd', () => traces)
+    traces.push(trace('frontend-design-triggered.jsonl'))
+    expect(handle.calls()).toHaveLength(1)
+    expect(handle.calls()[0].name).toBe('skill_view')
+  })
+})
+
+describe('reasoningReferenceDetector (hermes-shaped signal)', () => {
+  it('counts a by-name reference in the turn reasoning', () => {
+    const calls = reasoningReferenceDetector(
+      reasoningTrace('Let me load the frontend-design skill first since it is preloaded'),
+      'frontend-design',
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0].arguments.via).toBe('reasoning-reference')
+  })
+
+  it('stays discriminating: an unrelated turn is not a hit', () => {
+    // The negative case must fail for the right reason — reasoning is present
+    // and non-empty, it simply never names the skill (TODO §5 caveat).
+    const calls = reasoningReferenceDetector(
+      reasoningTrace('The user wants the weather. I will call the terminal tool.'),
+      'frontend-design',
+    )
+    expect(calls).toHaveLength(0)
   })
 })

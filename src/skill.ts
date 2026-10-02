@@ -9,11 +9,11 @@ export type SkillDetector = (trace: Trace, skillName: string) => ToolCall[]
 let customDetector: SkillDetector | undefined
 
 /**
- * Override the built-in skill-invocation heuristic (§11). Because the "which
- * tool_call means a skill fired" signal is agent- and version-specific and the
- * built-in {@link detectSkillInvocations} is an explicitly UNVERIFIED guess,
- * a suite that has observed its own agent's real traces can pin the signal
- * exactly. Call this from a `setupFiles` module (it runs inside each worker):
+ * Override the skill-invocation heuristic (§11) for the whole worker. Because
+ * the "which tool_call means a skill fired" signal is agent- and
+ * version-specific, a suite that has observed its own agent's real traces can
+ * pin the signal exactly. Call this from a `setupFiles` module (it runs inside
+ * each worker):
  *
  * ```ts
  * import { setSkillDetector } from 'agentfoo'
@@ -21,15 +21,61 @@ let customDetector: SkillDetector | undefined
  *   trace.toolCalls.filter((c) => c.name === 'skill_view' && c.arguments.name === name))
  * ```
  *
- * Pass `undefined` to restore the default.
+ * ⚠ This slot is per-worker GLOBAL, so it applies to *every* agent the worker
+ * boots. Since the signal differs per agent (§8.1) — opencode fires a real
+ * `skill({name})` tool call, hermes only names the skill in its reasoning — an
+ * override set here will grade a second agent with the first one's signal. Most
+ * suites should not need it: each adapter now ships its own default detector
+ * ({@link SkillHandle}), which is what runs when this is unset. Reach for it only
+ * to fix a signal agentfoo gets wrong, and prefer a union detector (match the
+ * tool call *and* scan reasoning) over an agent-shaped one.
+ *
+ * Pass `undefined` to restore per-agent defaults.
  */
 export function setSkillDetector(fn: SkillDetector | undefined): void {
   customDetector = fn
 }
 
-/** The active detector: the custom override if set, else the built-in guess. */
-export function activeDetector(): SkillDetector {
-  return customDetector ?? detectSkillInvocations
+/**
+ * Resolve the detector for one skill handle, most specific override first:
+ * the global {@link setSkillDetector} slot, then the owning adapter's own
+ * default, then the built-in guess.
+ */
+export function activeDetector(agentDetector?: SkillDetector): SkillDetector {
+  return customDetector ?? agentDetector ?? detectSkillInvocations
+}
+
+/**
+ * Detector for agents that **preload** skills into the system prompt, where
+ * activating one is not a tool call at all: hermes is the verified case (§5).
+ * The genuine signal there is the model naming the skill in its reasoning
+ * ("load the frontend-design skill…"), so a by-name reference in a turn's
+ * `reasoning` (or, failing that, its visible content) counts as one invocation
+ * and is surfaced as a synthetic `skill:<name>` marker call — which is what
+ * `toHaveBeenCalled` counts.
+ *
+ * Verified against real traces from both hermes paths — the recorded native
+ * `sessions export` run and the ACP/acpx stream — because reasoning is a
+ * first-class {@link TraceMessage.reasoning} field that both parsers populate
+ * (hermes `reasoning`/`reasoning_content`; ACP `agent_thought_chunk`). The
+ * negative case discriminates: an unrelated turn never names the skill.
+ */
+export const reasoningReferenceDetector: SkillDetector = (trace, skillName) => {
+  const needle = skillName.toLowerCase()
+  const calls: ToolCall[] = []
+  for (const msg of trace.messages) {
+    const evidence = [msg.reasoning, msg.content]
+      .filter((s): s is string => typeof s === 'string')
+      .find((s) => s.toLowerCase().includes(needle))
+    if (evidence) {
+      calls.push({
+        name: `skill:${skillName}`,
+        arguments: { via: 'reasoning-reference', name: skillName },
+        result: evidence.slice(0, 200),
+      })
+    }
+  }
+  return calls
 }
 
 /**
@@ -99,13 +145,21 @@ export class SkillHandle {
     readonly path: string,
     /** provides the traces accumulated so far by the owning agent. */
     private readonly getTraces: () => Trace[],
+    /**
+     * The owning adapter's default detector, used unless a suite has overridden
+     * detection globally with {@link setSkillDetector}. Adapters pass this so a
+     * suite that boots two agents grades each with its own signal (§5) —
+     * detection cannot be one global guess, because the signal is per-agent
+     * (§8.1). Omit to fall back to {@link detectSkillInvocations}.
+     */
+    private readonly agentDetector?: SkillDetector,
   ) {
     this.since = getTraces().length
   }
 
   /** Detected invocations of this skill, in order, since the handle was loaded. */
   calls(): ToolCall[] {
-    const detect = activeDetector()
+    const detect = activeDetector(this.agentDetector)
     return this.getTraces()
       .slice(this.since)
       .flatMap((t) => detect(t, this.name))

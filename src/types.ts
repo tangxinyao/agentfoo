@@ -108,16 +108,22 @@ export interface TraceMessage {
 }
 
 /**
- * Normalized conversation trace. Built directly from hermes' session export
- * (§7 / §10 — we deliberately do not invent a new schema).
+ * Normalized conversation trace, shaped after an OpenAI chat transcript
+ * (§7 / §10 — we deliberately do not invent a new schema). Every agent's wire
+ * envelope is decoded into this by one of the parsers in `src/trace.ts`.
  */
 export interface Trace {
+  /** Messages in emission order; a tool result follows the turn that called it. */
   messages: TraceMessage[]
   /** Flattened tool calls across all assistant turns, in order. */
   toolCalls: ToolCall[]
   /** Last assistant text message. */
   finalMessage: string
-  /** Original parsed jsonl records, untouched, for escape-hatch inspection. */
+  /**
+   * The CLI's own parsed records, exactly as it emitted them — never the
+   * normalized/synthesized messages — so the escape hatch can reach anything
+   * this layer drops.
+   */
   raw: unknown[]
   /** Full rendered transcript, used as the default target for `toSatisfy`. */
   text(): string

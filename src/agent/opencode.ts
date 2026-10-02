@@ -2,22 +2,29 @@ import { join } from 'node:path'
 import type { AgentConfig, Trace } from '../types.js'
 import type { RuntimeEnv } from '../runtime/types.js'
 import type { Agent, AgentBootOptions } from './types.js'
-import { parseOpencodeTrace } from '../trace.js'
+import { parseOpencodePartTrace } from '../trace.js'
 import { SkillHandle } from '../skill.js'
 import { preview, progress, withHeartbeat } from '../progress.js'
 import { collectCredentials, readSkillName } from './shared.js'
 import { resolveModelProvider } from './hermes.js'
 
 /**
- * Adapter for sst's opencode (§7). opencode has a clean non-interactive CLI:
+ * Adapter for opencode (§7). opencode has a clean non-interactive CLI:
  * `opencode run "<prompt>" --model <provider/model> --format json` prints the
  * turn's events as JSON on stdout, so — unlike hermes — there is no separate
  * `sessions export` step; the run output *is* the trace source.
  *
- * VERIFY-CLI (confirm against a real opencode binary): the `run --format json`
- * envelope (parsed by {@link parseOpencodeTrace}), the custom-provider config
- * schema written by {@link renderOpencodeConfig}, and how a skill directory is
- * preloaded (opencode's skill/command mechanism differs from hermes `-s`).
+ * The *flags* are verified against the real 1.18.5 binary (TODO §3): `run` takes
+ * `--format default|json`, `-m/--model <provider/model>`, `-s/--session <id>`,
+ * `-c/--continue`, and `--auto` (the non-interactive approval flag, opencode's
+ * analogue of hermes' `--approve-all`).
+ *
+ * VERIFY-CLI (still needs a live turn): the `run --format json` envelope itself
+ * (parsed by {@link parseOpencodePartTrace}), the real session-id key
+ * ({@link extractOpencodeSessionId} guesses three shapes), the custom-provider
+ * schema written by {@link renderOpencodeConfig}, and which directory opencode
+ * reads skills from. `scripts/probe-opencode.sh` answers all four in one
+ * container session.
  */
 export class OpencodeAgent implements Agent {
   private readonly env: RuntimeEnv
@@ -57,9 +64,21 @@ export class OpencodeAgent implements Agent {
   async loadSkill(hostPath: string): Promise<SkillHandle> {
     const name = await readSkillName(hostPath)
     if (!this.loadedSkills.has(name)) {
-      await this.env.copyDir(hostPath, join(this.env.skillsPath, name))
+      // opencode discovers global skills at `$XDG_CONFIG_HOME/opencode/skills/
+      // <name>/SKILL.md` — NOT the runtime's shared `skillsPath`
+      // (`$XDG_CONFIG_HOME/skills`), which is where hermes reads them from. The
+      // missing `opencode/` segment meant the skill was copied into the
+      // container but never discovered, so the agent answered the design prompt
+      // unaided and `toHaveBeenCalled` failed with no tool calls at all.
+      // (Project-level `<cwd>/.opencode/skills` also works; the global dir is
+      // used to keep the workspace exactly as the fixture seeded it.)
+      await this.env.copyDir(hostPath, join(this.env.agentHome, 'opencode', 'skills', name))
       this.loadedSkills.add(name)
     }
+    // No adapter-level detector: opencode exposes a native `skill` tool, so a
+    // firing is a genuine `skill({ name })` tool call — the one agent the
+    // built-in `detectSkillInvocations` heuristic was written for (§8.1). Still
+    // unconfirmed against a live trace; pin it here if the probe says otherwise.
     return new SkillHandle(name, hostPath, () => this.traces)
   }
 
@@ -92,7 +111,7 @@ export class OpencodeAgent implements Agent {
     this.sessionId = extractOpencodeSessionId(stdout) ?? this.sessionId
     this.started = true
 
-    const trace = parseOpencodeTrace(stdout)
+    const trace = parseOpencodePartTrace(stdout)
     progress(`  trace: ${trace.messages.length} messages, ${trace.toolCalls.length} tool calls`)
     this.traces.push(trace)
     this.onTrace?.({ trace, sessionJsonl: stdout })
@@ -109,7 +128,11 @@ export class OpencodeAgent implements Agent {
   }
 
   private buildRunArgv(prompt: string): string[] {
-    const argv = ['opencode', 'run', prompt, '--format', 'json']
+    // `--auto` auto-approves permissions that are not explicitly denied — the
+    // non-interactive lever hermes spells `--approve-all`. Verified present on
+    // `opencode run` 1.18.5; without it a turn that edits a file can block on a
+    // permission prompt with no tty to answer it.
+    const argv = ['opencode', 'run', prompt, '--format', 'json', '--auto']
     const model = modelFlag(this.config)
     if (model) argv.push('--model', model)
     // Continue the same session across turns within a test. Prefer an explicit

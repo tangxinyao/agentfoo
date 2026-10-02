@@ -84,7 +84,7 @@ function boot(env: RuntimeEnv, config: AgentConfig = {}, currentTest?: () => str
   return new AcpxAgent(hermesAcpxSpec, opts)
 }
 
-/** A minimal one-turn ACP stream so parseAcpxTrace yields a non-empty trace. */
+/** A minimal one-turn ACP stream so parseAcpTrace yields a non-empty trace. */
 const oneTurn = (text: string) =>
   `{"jsonrpc":"2.0","method":"session/update","params":{"update":{"content":{"text":${JSON.stringify(text)},"type":"text"},"sessionUpdate":"agent_message_chunk"}}}`
 
@@ -180,5 +180,29 @@ describe('AcpxAgent driving hermes (cwd-session model)', () => {
     )
     const agent = boot(env)
     await expect(agent.run('hello')).rejects.toThrow(/acpx hermes exited 2\nboom/)
+  })
+})
+
+/**
+ * §5: the reasoning-scan detector used to live in the example suite's
+ * `setSkillDetector` — a per-worker global that would have graded a second
+ * agent with hermes' signal. It is now the hermes adapter's own default, so the
+ * handle hermes hands back detects a preloaded-skill firing on its own.
+ */
+describe('hermes skill detection (adapter default)', () => {
+  it('counts a by-name mention in reasoning, with no tool call at all', async () => {
+    const thought =
+      '{"jsonrpc":"2.0","method":"session/update","params":{"update":' +
+      '{"content":{"text":"Let me load the frontend-design skill first.","type":"text"},' +
+      '"sessionUpdate":"agent_thought_chunk"}}}'
+    const env = fakeEnv((argv) => (argv.includes('--format') ? { stdout: thought } : {}))
+    const agent = boot(env)
+
+    const handle = await agent.loadSkill('/host/skills/frontend-design')
+    const trace = await agent.run('design me a landing page')
+
+    expect(trace.toolCalls).toHaveLength(0)
+    expect(handle.calls()).toHaveLength(1)
+    expect(handle.calls()[0].name).toBe('skill:frontend-design')
   })
 })

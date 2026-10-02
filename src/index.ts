@@ -33,8 +33,20 @@ export type {
 } from './agent/command.js'
 export { hermesAcpxSpec, resolveModelProvider, renderConfigYaml } from './agent/hermes.js'
 export type { Agent, AgentBootOptions } from './agent/types.js'
-export { SkillHandle, setSkillDetector, detectSkillInvocations } from './skill.js'
-export { parseTrace, buildTrace, parseOpencodeTrace, parseAcpxTrace } from './trace.js'
+export { SkillHandle, setSkillDetector, detectSkillInvocations, reasoningReferenceDetector } from './skill.js'
+// Trace parsers are named after the wire envelope they decode, not after an
+// agent: four built-in agents map onto three envelopes (hermes/pi/openclaw all
+// speak ACP), and a bring-your-own CLI may reuse any of them.
+export {
+  parseOpenAiChatTrace,
+  parseOpencodePartTrace,
+  parseAcpTrace,
+  buildTrace,
+  // Deprecated pre-0.2 aliases.
+  parseTrace,
+  parseOpencodeTrace,
+  parseAcpxTrace,
+} from './trace.js'
 
 export type {
   AgentConfig,
