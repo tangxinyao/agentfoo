@@ -189,12 +189,23 @@ export class SkillHandle {
      * (§8.1). Omit to fall back to {@link detectSkillInvocations}.
      */
     private readonly agentDetector?: SkillDetector,
+    /**
+     * True when this handle was loaded with `{ force: true }` (forced mode,
+     * TODO §P1): the skill's content was injected deterministically, skipping
+     * the model's own discovery/decision step, so "was it invoked" is not a
+     * meaningful question — it was, by construction. `calls()` /
+     * `observedToolCalls()` throw here rather than silently returning an
+     * always-true or always-empty result, steering a forced-mode test toward
+     * `toSatisfy` (grading the skill's effect) instead.
+     */
+    private readonly forced = false,
   ) {
     this.since = getTraces().length
   }
 
   /** Detected invocations of this skill, in order, since the handle was loaded. */
   calls(): ToolCall[] {
+    this.assertNotForced('calls')
     const detect = activeDetector(this.agentDetector)
     return this.getTraces()
       .slice(this.since)
@@ -209,8 +220,19 @@ export class SkillHandle {
    * matched) — the latter points at {@link setSkillDetector}.
    */
   observedToolCalls(): ToolCall[] {
+    this.assertNotForced('observedToolCalls')
     return this.getTraces()
       .slice(this.since)
       .flatMap((t) => t.toolCalls)
+  }
+
+  private assertNotForced(method: string): void {
+    if (this.forced) {
+      throw new Error(
+        `${method}() is meaningless on a skill loaded with { force: true }: forced mode ` +
+          "injects the skill deterministically, so there is no discovery decision to spy " +
+          'on. Assert the skill\'s effect with toSatisfy(...) instead.',
+      )
+    }
   }
 }

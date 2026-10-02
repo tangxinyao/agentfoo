@@ -135,6 +135,7 @@ function fakeEnv(
     workspacePath: '/workspace',
     skillsPath: '/tmp/agenthome/skills',
     agentHome: '/tmp/agenthome',
+    homeEnvVar: 'OPENCLAW_STATE_DIR',
     async exec(argv: string[], opts?: ExecOptions): Promise<ExecResult> {
       calls.push(argv)
       execEnvs.push(opts?.env)
@@ -272,8 +273,10 @@ describe('AcpxAgent driving openclaw', () => {
 
     await agent.run('design me a landing page')
 
-    expect(env.calls[0]).toEqual(['acpx', '--cwd', '/workspace', 'openclaw', 'sessions', 'new'])
-    expect(env.calls[1]).toEqual([
+    // 1st exec: the acpx host-resolution probe (TODO §P1.5 #3)
+    expect(env.calls[0]).toEqual(['acpx', '--version'])
+    expect(env.calls[1]).toEqual(['acpx', '--cwd', '/workspace', 'openclaw', 'sessions', 'new'])
+    expect(env.calls[2]).toEqual([
       'acpx', '--cwd', '/workspace', '--approve-all', '--format', 'json',
       'openclaw', 'design me a landing page',
     ])

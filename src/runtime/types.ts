@@ -24,6 +24,13 @@ export interface RuntimeEnv {
   readonly skillsPath: string
   /** Home dir for the agent's own state (hermes home: config + session db). */
   readonly agentHome: string
+  /**
+   * Env var this runtime sets to `agentHome` on every exec by default (hermes:
+   * `HERMES_HOME`). Exposed so an adapter can override it per call — e.g.
+   * {@link file://../agent/acpx.ts AcpxAgent}'s `isolatePerTest` points a
+   * freshly spawned process at a different, per-test home (TODO §P0).
+   */
+  readonly homeEnvVar: string
   exec(argv: string[], opts?: ExecOptions): Promise<ExecResult>
   /** Copy a host directory's contents into `dest` inside the env. */
   copyDir(hostSrc: string, dest: string): Promise<void>

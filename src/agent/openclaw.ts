@@ -45,14 +45,18 @@ import { progress } from '../progress.js'
  *    means *unrestricted*. `plugins.enabled: false` is the real knob.
  *
  * OPERATIONAL NOTE — **this agent needs a big host.** The Gateway grows to
- * ~850MB RSS during a single design turn, with zero plugins loaded, and on a
- * 2GB host the OOM killer takes it mid-turn every time. Measured, not
- * estimated: `anon-rss:849868kB`, killed by `global_oom`. Capping V8
- * (`NODE_OPTIONS=--max-old-space-size=512`) does **not** bound it — total-vm
- * drops but RSS lands in the same place, so the allocation is not old-space.
- * Budget ≥2GB *free* for the container. The symptom is `Gateway disconnected:
- * 1006` inside the stream and `agent needs reconnect` from acpx, neither of
- * which mentions memory — which is what {@link openclawAcpxSpec.diagnose} is for.
+ * ~850MB RSS during a single design turn, with zero plugins loaded. Measured,
+ * not estimated: `anon-rss:849868kB`, killed by `global_oom` on a box with
+ * 1870MB total. Capping V8 (`NODE_OPTIONS=--max-old-space-size=512`) does
+ * **not** bound it — total-vm drops but RSS lands in the same place, so the
+ * allocation is not old-space.
+ *
+ * **Budget ~1.5GB *free*.** An earlier revision of this note said ">=2GB",
+ * which was an over-estimate made during the OOM round itself; the suite has
+ * since run green to completion with roughly 1.5GB free. The symptom of not
+ * having it is `Gateway disconnected: 1006` inside the stream and `agent needs
+ * reconnect` from acpx, neither of which mentions memory — which is what
+ * {@link openclawAcpxSpec.diagnose} is for.
  */
 
 /** Loopback port the Gateway listens on, and the bridge dials. */
@@ -200,7 +204,7 @@ export const openclawAcpxSpec: AcpxSpec = {
       `if ${connectProbe} 2>/dev/null; then echo "gateway: listening"; else ` +
         `echo "gateway: NOT listening on ${OPENCLAW_GATEWAY_PORT} — it died during the run."; ` +
         `echo "The usual cause is the host OOM killer: the Gateway grows to ~850MB RSS,"; ` +
-        `echo "and capping V8's heap does not bound it. Give the host >=2GB free."; fi; ` +
+        `echo "and capping V8's heap does not bound it. Give the host ~1.5GB free."; fi; ` +
         `echo "--- ${GATEWAY_LOG} (tail) ---"; tail -20 ${GATEWAY_LOG} 2>/dev/null`,
     ])
     return stdout.trim() || undefined

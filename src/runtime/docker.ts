@@ -116,14 +116,14 @@ class DockerEnv implements RuntimeEnv {
   constructor(
     readonly id: string,
     private readonly container: string,
-    private readonly homeEnvVar: string,
+    readonly homeEnvVar: string,
   ) {}
 
   exec(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
     const envArgs = Object.entries({ [this.homeEnvVar]: this.agentHome, ...opts.env }).flatMap(
       ([k, v]) => ['-e', `${k}=${v}`],
     )
-    return runDocker([
+    return runDockerExec([
       'exec',
       '-w', opts.cwd ?? this.workspacePath,
       ...envArgs,
@@ -208,6 +208,42 @@ function runDocker(args: string[], opts: { inheritStdio?: boolean } = {}): Promi
     child.on('close', (code) => {
       if (code === 0) resolve({ stdout, stderr, exitCode: code })
       else reject(new Error(`docker ${args[0]} failed (exit ${code}): ${stderr || stdout}`))
+    })
+  })
+}
+
+/**
+ * Docker exit code 125 is the Moby CLI's own convention for "docker itself
+ * failed to run the command" (bad flags, daemon unreachable, no such
+ * container) — distinct from 126/127/N, which are the *executed* command's
+ * own exit space (not executable / not found / whatever it returned).
+ */
+const DOCKER_ITSELF_FAILED = 125
+
+/**
+ * `docker exec` specifically: resolve on any exit code from the *executed*
+ * command, matching {@link file://./local.ts LocalEnv.exec}'s semantics, so an
+ * adapter's `if (exitCode !== 0)` branch means the same thing under both
+ * runtimes (TODO §P1.5 #1 — before this fix that branch, including
+ * `AcpxSpec.diagnose()`, was dead code under Docker). Only a spawn error or
+ * docker's own exit-125 convention rejects; every other case is a legitimate
+ * result of running the command, not a failure of `runDockerExec` itself.
+ */
+function runDockerExec(args: string[]): Promise<ExecResult> {
+  const [bin, ...prefix] = dockerCommand()
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, [...prefix, ...args], { stdio: 'pipe' })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (d) => (stdout += d.toString()))
+    child.stderr?.on('data', (d) => (stderr += d.toString()))
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (code === DOCKER_ITSELF_FAILED) {
+        reject(new Error(`docker exec failed (exit ${code}): ${stderr || stdout}`))
+        return
+      }
+      resolve({ stdout, stderr, exitCode: code ?? -1 })
     })
   })
 }

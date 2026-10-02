@@ -20,6 +20,7 @@ function fakeEnv(
     workspacePath: '/workspace',
     skillsPath: '/skills',
     agentHome: '/home',
+    homeEnvVar: 'AGENT_HOME',
     async exec(argv, opts) {
       calls.push(argv)
       return onExec(argv, opts)

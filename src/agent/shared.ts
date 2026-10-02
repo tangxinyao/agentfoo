@@ -27,3 +27,13 @@ export async function readSkillName(hostPath: string): Promise<string> {
   }
   return basename(hostPath)
 }
+
+/**
+ * Full SKILL.md body (frontmatter included), for forced-mode injection
+ * (TODO §P1) — unlike {@link readSkillName} there is no fallback: forced mode
+ * has nothing to inject if the file is missing, so a missing SKILL.md should
+ * surface as a real error, not silently degrade.
+ */
+export function readSkillBody(hostPath: string): Promise<string> {
+  return readFile(join(hostPath, 'SKILL.md'), 'utf8')
+}

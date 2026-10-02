@@ -69,6 +69,7 @@ function fakeEnv(stdout = ''): RuntimeEnv & { calls: string[][] } {
     workspacePath: '/workspace',
     skillsPath: '/skills',
     agentHome: '/home/agent',
+    homeEnvVar: 'XDG_CONFIG_HOME',
     async exec(argv: string[]): Promise<ExecResult> {
       calls.push(argv)
       return { stdout, stderr: '', exitCode: 0 }
@@ -94,6 +95,15 @@ function boot(env: RuntimeEnv, config: AgentConfig = {}) {
  */
 const SESSION_STDOUT =
   '{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"done"}}'
+
+describe('OpencodeAgent.loadSkill forced mode (TODO §P1)', () => {
+  it('rejects { force: true } — no verified forcing lever for opencode yet', async () => {
+    const agent = boot(fakeEnv())
+    await expect(agent.loadSkill('/skills/anything', { force: true })).rejects.toThrow(
+      /not implemented for opencode/,
+    )
+  })
+})
 
 describe('OpencodeAgent run argv', () => {
   it('runs non-interactively with --format json --auto', async () => {

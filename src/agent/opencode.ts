@@ -61,7 +61,14 @@ export class OpencodeAgent implements Agent {
     await this.env.exec(['sh', '-c', `cat > "${join(dir, 'opencode.json')}" <<'AGENTFOO_EOF'\n${json}\nAGENTFOO_EOF`])
   }
 
-  async loadSkill(hostPath: string): Promise<SkillHandle> {
+  async loadSkill(hostPath: string, opts?: { force?: boolean }): Promise<SkillHandle> {
+    if (opts?.force) {
+      throw new Error(
+        'loadSkill(..., { force: true }) is not implemented for opencode: no verified ' +
+          'forcing lever yet (TODO §P1). Load it without `force` to rely on the native ' +
+          '`skill` tool + autonomous discovery instead.',
+      )
+    }
     const name = await readSkillName(hostPath)
     if (!this.loadedSkills.has(name)) {
       // opencode discovers global skills at `$XDG_CONFIG_HOME/opencode/skills/

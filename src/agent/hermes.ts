@@ -70,6 +70,31 @@ export const hermesAcpxSpec: AcpxSpec = {
   // `setSkillDetector`, which is a per-worker global and would have mis-graded
   // any second agent booted alongside hermes.
   skillDetector: reasoningReferenceDetector,
+  // hermes' `session search` tool reads across its whole home's session DB
+  // regardless of which `sessions new` conversation is active, so two tests
+  // sharing a home leak seeded data between them (TODO §P0, real-machine
+  // reproduced: a secret seeded in one test came back verbatim when a later
+  // test asked it to search its own history). pi/openclaw have no equivalent
+  // surface, so this stays unset for them.
+  isolatePerTest: true,
+  /**
+   * Forced mode (TODO §P1): inline the SKILL.md body directly ahead of the
+   * prompt. Chosen over the other two candidates the TODO named, both ruled
+   * out without needing a live call: (a) a literal `/<skill-name> <prompt>`
+   * slash command — a real captured hermes trace's `available_commands_update`
+   * lists only generic gateway commands (`help`, `model`, `bash`, `compact`, …),
+   * no per-skill entries, so hermes' ACP bridge has nothing to parse a
+   * `/<skill-name>` into; it would just be literal text. (b) acpx's
+   * `--append-system-prompt` — its own `--help` documents this as routing
+   * through ACP `_meta.systemPrompt.append`, which is a claude-agent-acp
+   * extension; hermes' ACP bridge has no code reading that `_meta` key, so it
+   * would be a silent no-op. Inlining is the one lever guaranteed to reach the
+   * model regardless of bridge internals, at the cost of prompt-level (not
+   * true system-prompt-level) placement.
+   */
+  forceSkill: ({ skillBody, prompt }) =>
+    `The following skill is active for this task — follow its instructions:\n\n` +
+    `${skillBody}\n\n---\n\n${prompt}`,
   async init({ env, config }): Promise<void> {
     const yaml = renderConfigYaml(config)
     await env.exec(['sh', '-c', `mkdir -p "${env.agentHome}"`])

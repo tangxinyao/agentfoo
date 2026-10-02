@@ -15,8 +15,16 @@ export interface Agent {
   readonly traces: Trace[]
   /** Write the agent's config into its isolated home before the first run. */
   init(): Promise<void>
-  /** Copy a skill directory in so it can be preloaded; returns a spy handle. */
-  loadSkill(hostPath: string): Promise<SkillHandle>
+  /**
+   * Copy a skill directory in so it can be preloaded; returns a spy handle.
+   * `{ force: true }` (forced mode, TODO §P1) deterministically injects the
+   * skill's content, skipping the agent's own discovery step — useful for
+   * grading a SKILL.md's content quality independent of whether the model
+   * would have chosen to load it. Only adapters with a verified forcing lever
+   * support it; others throw. Never combine with `toHaveBeenCalled` on the
+   * returned handle (it throws) — use `toSatisfy` instead.
+   */
+  loadSkill(hostPath: string, opts?: { force?: boolean }): Promise<SkillHandle>
   /** Seed initial workspace files. Only callable once per instance (§4). */
   loadWorkspace(hostPath: string): Promise<string>
   /** One conversation turn; subsequent calls continue the same session (§4). */

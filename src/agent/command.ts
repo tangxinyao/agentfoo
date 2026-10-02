@@ -148,7 +148,14 @@ export class CommandAgent implements Agent {
     })
   }
 
-  async loadSkill(hostPath: string): Promise<SkillHandle> {
+  async loadSkill(hostPath: string, opts?: { force?: boolean }): Promise<SkillHandle> {
+    if (opts?.force) {
+      throw new Error(
+        'loadSkill(..., { force: true }) is not implemented for a registerCommandAgent ' +
+          'adapter (TODO §P1): no generic forcing lever exists across BYO CLIs. Load it ' +
+          'without `force` to rely on autonomous discovery instead.',
+      )
+    }
     const name = await readSkillName(hostPath)
     if (!this.loadedSkills.has(name)) {
       await this.env.copyDir(hostPath, join(this.env.skillsPath, name))

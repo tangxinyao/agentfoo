@@ -49,20 +49,22 @@ describe('renderPiModelsJson (pi models.json schema)', () => {
     expect(doc.providers.deepseek).toEqual({
       baseUrl: 'https://api.deepseek.com',
       api: 'openai-completions',
-      apiKey: 'DEEPSEEK_API_KEY',
+      apiKey: '${DEEPSEEK_API_KEY}',
       models: [{ id: 'deepseek-v4-pro' }],
     })
   })
 
-  // pi resolves a bare `apiKey` string as the NAME of an env var, which is what
-  // keeps the secret arriving over passEnv instead of landing on disk.
-  it('writes the env var name, never the key value itself', () => {
+  // pi interpolates `${VAR}` in config values, which is what keeps the secret
+  // arriving over passEnv instead of landing on disk. The `$` is load-bearing:
+  // a bare name is taken as the literal key, and pi-acp reports the resulting
+  // 401 as an empty `end_turn` turn rather than an error (see renderPiModelsJson).
+  it('writes an env var reference, never the key value itself', () => {
     const json = renderPiModelsJson({
       model: 'deepseek/x',
       baseUrl: 'https://api.deepseek.com',
       passEnv: ['DEEPSEEK_API_KEY'],
     })!
-    expect(json).toContain('"apiKey": "DEEPSEEK_API_KEY"')
+    expect(json).toContain('"apiKey": "${DEEPSEEK_API_KEY}"')
     expect(json).not.toContain('sk-')
   })
 
@@ -100,6 +102,7 @@ function fakeEnv(
     workspacePath: '/workspace',
     skillsPath: '/tmp/agenthome/skills',
     agentHome: '/tmp/agenthome',
+    homeEnvVar: 'PI_CODING_AGENT_DIR',
     async exec(argv: string[], _opts?: ExecOptions): Promise<ExecResult> {
       calls.push(argv)
       return { stdout: '', stderr: '', exitCode: 0, ...route(argv) }
@@ -153,8 +156,10 @@ describe('AcpxAgent driving pi', () => {
 
     await agent.run('design me a landing page')
 
-    expect(env.calls[0]).toEqual(['acpx', '--cwd', '/workspace', 'pi', 'sessions', 'new'])
-    expect(env.calls[1]).toEqual([
+    // 1st exec: the acpx host-resolution probe (TODO §P1.5 #3)
+    expect(env.calls[0]).toEqual(['acpx', '--version'])
+    expect(env.calls[1]).toEqual(['acpx', '--cwd', '/workspace', 'pi', 'sessions', 'new'])
+    expect(env.calls[2]).toEqual([
       'acpx', '--cwd', '/workspace', '--approve-all', '--format', 'json',
       '--model', 'deepseek/deepseek-v4-pro', 'pi', 'design me a landing page',
     ])

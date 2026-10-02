@@ -69,6 +69,29 @@ describe('SkillHandle', () => {
   })
 })
 
+describe('SkillHandle forced mode (TODO §P1)', () => {
+  it('throws on calls() instead of a meaningless spy result', () => {
+    const traces: Trace[] = []
+    const handle = new SkillHandle('frontend-design', '/skills/fd', () => traces, undefined, true)
+    traces.push(trace('frontend-design-triggered.jsonl'))
+    expect(() => handle.calls()).toThrow(/force: true/)
+  })
+
+  it('throws on observedToolCalls() too', () => {
+    const traces: Trace[] = []
+    const handle = new SkillHandle('frontend-design', '/skills/fd', () => traces, undefined, true)
+    traces.push(trace('frontend-design-triggered.jsonl'))
+    expect(() => handle.observedToolCalls()).toThrow(/force: true/)
+  })
+
+  it('an unforced handle is unaffected (default stays false)', () => {
+    const traces: Trace[] = []
+    const handle = new SkillHandle('frontend-design', '/skills/fd', () => traces)
+    traces.push(trace('frontend-design-triggered.jsonl'))
+    expect(() => handle.calls()).not.toThrow()
+  })
+})
+
 describe('setSkillDetector', () => {
   afterEach(() => setSkillDetector(undefined))
 

@@ -43,10 +43,27 @@ import { resolveModelProvider } from './hermes.js'
  * `google-generative-ai`. Returns undefined when there is nothing to configure —
  * a provider pi has built in authenticates from the env var alone.
  *
- * `apiKey` is deliberately the **name** of an env var, not a key: pi resolves a
- * bare string as a variable name (a literal key and a `!command` are the other
- * two forms), so the secret keeps arriving through `passEnv` and never lands on
- * the container's disk.
+ * `apiKey` is deliberately a `${VAR}` *reference*, not a key, so the secret keeps
+ * arriving through `passEnv` and never lands on the container's disk. **The `$`
+ * is load-bearing, and which spelling works changed under us**:
+ *
+ * - pi 0.82.1 interpolates `$ENV_VAR` / `${ENV_VAR}` in config values (`!` runs a
+ *   command, `$$` escapes a `$`). A **bare** `DEEPSEEK_API_KEY` is not a variable
+ *   name there — it is sent as the literal key.
+ * - pi 0.73.1, the version `dockers/pi.Dockerfile` pins, documents bare as "env
+ *   var name or literal value" and accepts **both** spellings.
+ *
+ * `${VAR}` is therefore the only spelling that works on both, which is why it is
+ * the one written here — probed against real 0.73.1 and 0.82.1 binaries.
+ *
+ * Two things made the bare version survive this long. It never failed in Docker:
+ * a control run on 0.73.1 with a deliberately nonexistent var name **still
+ * authenticated**, because `deepseek` collides with a provider pi has built in,
+ * and that one reads `DEEPSEEK_API_KEY` from the env directly — so this line was
+ * never load-bearing there and the suite's green said nothing about it. And when
+ * 0.82.1 did make it load-bearing, the failure was invisible: pi-acp swallows the
+ * 401 and answers `stopReason: end_turn` with zero content, so acpx still exits 0
+ * and the only symptom is an empty trace ({@link isSilentTurn} now catches that).
  */
 export function renderPiModelsJson(config: AgentConfig): string | undefined {
   const { model, provider } = resolveModelProvider(config)
@@ -58,7 +75,7 @@ export function renderPiModelsJson(config: AgentConfig): string | undefined {
       [provider]: {
         baseUrl: config.baseUrl,
         api: 'openai-completions',
-        ...(apiKeyEnv ? { apiKey: apiKeyEnv } : {}),
+        ...(apiKeyEnv ? { apiKey: `\${${apiKeyEnv}}` } : {}),
         models: model ? [{ id: model }] : [],
       },
     },
