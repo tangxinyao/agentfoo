@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { takeOption } from './cli-args.js'
 
 /**
  * `agentfoo` CLI (§ "CLI 一览"). A thin translation layer over the vitest CLI so
@@ -16,6 +17,7 @@ import { fileURLToPath } from 'node:url'
  *   agentfoo run skills/frontend      → …run skills/frontend   (path filter)
  *   agentfoo run -t "should trigger"  → …run -t "should trigger"
  *   agentfoo run --local              → AGENTFOO_FORCE_LOCAL=1 …run
+ *   agentfoo run -a opencode          → AGENTFOO_AGENT=opencode …run
  *   agentfoo list                     → vitest list  (collect specs, no LLM calls)
  *   agentfoo watch                    → vitest (watch) --config agentfoo.config.ts
  *   agentfoo run --env-file path/.env → load that .env instead of the nearest one
@@ -26,7 +28,13 @@ function main(): void {
   // `--env-file <path>` / `--env-file=<path>` lets a suite in a sibling subtree
   // point at a shared .env instead of relying on the cwd-upward walk finding it
   // (which can't reach a sibling repo's file). Consumed here, never forwarded.
-  const { envFile, args: cliArgs } = takeEnvFile(rawArgs)
+  const { value: envFile, args: afterEnvFile } = takeOption(rawArgs, ['--env-file'])
+
+  // `-a <kind>` / `--agent <kind>` picks which configured agent the suite runs
+  // against, so one spec set can be pointed at a different agent without editing
+  // the fixtures (they must call `bootAgent()` with no kind to opt in). Consumed
+  // here — vitest has no such flag and would reject it.
+  const { value: agentKind, args: cliArgs } = takeOption(afterEnvFile, ['-a', '--agent'])
 
   // Load .env (provider keys / model wiring) before we snapshot process.env, so
   // the values reach both this process and the vitest workers we spawn.
@@ -54,8 +62,22 @@ function main(): void {
   // Register the `.js`→`.ts` resolve shim so vitest can load the TypeScript
   // agentfoo config (and the framework source it pulls in) when running against
   // the raw sources in-repo. No-op against a compiled `.js` build.
+  //
+  // Note this only covers the *child*. This module's own relative imports need the
+  // same shim, which cannot be self-registered from inside it — so running the
+  // sources directly requires `node --import scripts/register-ts.mjs src/cli.ts`
+  // (what `npm run example` does). The published `bin` is compiled `dist/cli.js`,
+  // where `.js` specifiers resolve natively and none of this applies.
   const hook = fileURLToPath(new URL('../scripts/register-ts.mjs', import.meta.url))
   env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--import ${hook}`].filter(Boolean).join(' ')
+
+  if (agentKind !== undefined) {
+    if (!agentKind || agentKind.startsWith('-')) {
+      console.error('-a/--agent needs an agent kind, e.g. `agentfoo run -a opencode`.')
+      process.exit(1)
+    }
+    env.AGENTFOO_AGENT = agentKind
+  }
 
   const passthrough: string[] = []
   for (const arg of rest) {
@@ -126,23 +148,6 @@ function resolveVitestBin(): string | undefined {
   } catch {
     return undefined
   }
-}
-
-/** Split `--env-file <path>` / `--env-file=<path>` out of the argv. */
-function takeEnvFile(args: string[]): { envFile?: string; args: string[] } {
-  const out: string[] = []
-  let envFile: string | undefined
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i]
-    if (a === '--env-file') {
-      envFile = args[++i]
-    } else if (a.startsWith('--env-file=')) {
-      envFile = a.slice('--env-file='.length)
-    } else {
-      out.push(a)
-    }
-  }
-  return { envFile, args: out }
 }
 
 function resolveCwd(p: string): string {

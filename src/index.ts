@@ -14,14 +14,32 @@ import './matchers.js'
 export { test, expect, describe, it, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
 
 export { bootAgent } from './fixtures.js'
+export { selectedAgentKind } from './config-runtime.js'
 export { retry } from './retry.js'
-export { HermesAgent } from './agent/hermes.js'
+export { OpencodeAgent } from './agent/opencode.js'
+export { AcpxAgent, acpxAgentFactory, acpxSpecFactory, type AcpxSpec } from './agent/acpx.js'
+export { registerAgent, type AgentSpec } from './agent/registry.js'
+export {
+  CommandAgent,
+  commandAgentFactory,
+  registerCommandAgent,
+} from './agent/command.js'
+export type {
+  CommandAgentDef,
+  CommandAgentRegistration,
+  CommandRunContext,
+  CommandInitContext,
+  CommandExportContext,
+} from './agent/command.js'
+export { hermesAcpxSpec, resolveModelProvider, renderConfigYaml } from './agent/hermes.js'
+export type { Agent, AgentBootOptions } from './agent/types.js'
 export { SkillHandle, setSkillDetector, detectSkillInvocations } from './skill.js'
-export { parseTrace, buildTrace } from './trace.js'
+export { parseTrace, buildTrace, parseOpencodeTrace, parseAcpxTrace } from './trace.js'
 
 export type {
   AgentConfig,
   AgentKind,
+  KnownAgentKind,
   AgentfooConfig,
   Runtime,
   Trace,

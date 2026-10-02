@@ -36,7 +36,10 @@ expect.extend({
     const criteria = Array.isArray(rubric) ? rubric.length : 1
     const result = await withHeartbeat(
       `judging (${model}, ${criteria} ${criteria === 1 ? 'criterion' : 'criteria'})`,
-      () => runJudge(text, rubric, { model, provider: cfg.judge.provider }, threshold),
+      // Spread the whole configured judge block, not just the model: baseUrl,
+      // apiKeyEnv and maxTokens are all part of "how to reach the judge" and
+      // silently dropping them makes a configured endpoint/key look ignored.
+      () => runJudge(text, rubric, { ...cfg.judge, model }, threshold),
     )
 
     const summary = result.breakdown

@@ -1,15 +1,19 @@
 import { test, expect } from '../../test/fixtures'
 
 /**
- * Skill tests for Anthropic's `frontend-design` skill on hermes-agent.
+ * Skill tests for Anthropic's `frontend-design` skill.
  *
- * These are live tests: each `hermes.run(...)` boots hermes (local runtime here)
- * and does a real model round-trip, so they require an LLM API key. Run with:
- *   agentfoo run --local
+ * These are live tests: each `agent.run(...)` boots the agent under test and does
+ * a real model round-trip, so they require an LLM API key. The agent is not
+ * hard-coded — the `agent` fixture resolves it from `-a/--agent`, defaulting to
+ * the sole agent in agentfoo.config.ts. Run with:
+ *   agentfoo run                # the configured default (hermes)
+ *   agentfoo run -a opencode    # same specs, different agent
+ *   agentfoo run --local        # host binary instead of Docker
  */
 
-test('triggers on a UI design request', async ({ hermes, frontendDesign }) => {
-  const trace = await hermes.run(
+test('triggers on a UI design request', async ({ agent, frontendDesign }) => {
+  const trace = await agent.run(
     '帮我为一个精品手冲咖啡品牌做一个产品落地页的视觉设计，要有格调、不要模板感。',
   )
 
@@ -28,7 +32,7 @@ test('triggers on a UI design request', async ({ hermes, frontendDesign }) => {
   )
 })
 
-test('does not trigger on an unrelated request', async ({ hermes, frontendDesign }) => {
-  await hermes.run('今天北京的天气怎么样？')
+test('does not trigger on an unrelated request', async ({ agent, frontendDesign }) => {
+  await agent.run('今天北京的天气怎么样？')
   expect(frontendDesign).not.toHaveBeenCalled()
 })

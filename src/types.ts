@@ -8,8 +8,21 @@
 
 export type Runtime = 'docker' | 'local'
 
-/** Which kind of target is under test. Today only hermes-agent (§7). */
-export type AgentKind = 'hermes'
+/**
+ * The agent kinds agentfoo ships built-in adapters for. `hermes` and `opencode`
+ * each have their own native CLI adapter; `pi` and `openclaw` are driven through
+ * the shared acpx ACP client (`acpx <agent>`).
+ */
+export type KnownAgentKind = 'hermes' | 'opencode' | 'pi' | 'openclaw'
+
+/**
+ * Which coding agent is under test. The four {@link KnownAgentKind}s work out of
+ * the box; any other string is valid too once registered at runtime via
+ * `registerAgent` / `registerCommandAgent` (§7), so bring-your-own agents need no
+ * change here. The `string & {}` member keeps editor autocomplete for the known
+ * kinds while still accepting arbitrary custom names.
+ */
+export type AgentKind = KnownAgentKind | (string & {})
 
 /** Resolved configuration for a single agent instance. */
 export interface AgentConfig {
@@ -81,6 +94,17 @@ export interface TraceMessage {
   /** For role === 'tool': which call this responds to. */
   toolCallId?: string
   toolName?: string
+  /**
+   * The model's reasoning/thinking for this turn, when the agent exports it
+   * (hermes `reasoning`/`reasoning_content`; ACP `agent_thought_chunk`).
+   *
+   * Kept because for some agents it is the *only* observable signal that a
+   * preloaded skill fired — hermes activates skills from its system prompt with
+   * no corresponding tool call, and names the skill only here (TODO §5).
+   * Deliberately excluded from {@link Trace.text} so it never pollutes the
+   * judge-graded transcript.
+   */
+  reasoning?: string
 }
 
 /**
@@ -154,6 +178,14 @@ export interface JudgeConfig {
    * conventional variable (`ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, …).
    */
   apiKeyEnv?: string
+  /**
+   * Output-token cap for one grading call. The verdict JSON itself is small,
+   * but reasoning models (deepseek-reasoner, deepseek-v4-pro, …) bill their
+   * hidden chain-of-thought against this same budget and can burn thousands of
+   * tokens before emitting the first character of JSON — so the default is
+   * deliberately roomy. Lower it only for a known non-reasoning judge.
+   */
+  maxTokens?: number
 }
 
 export interface AgentfooConfig {

@@ -40,6 +40,40 @@ describe('parseTrace', () => {
     expect(text).toContain('skill_view')
   })
 
+  // hermes' native session export carries the model's thinking in `reasoning` /
+  // `reasoning_content` (identical text). Preserved because for a preloaded skill
+  // it is the only evidence the skill fired (TODO §5).
+  it('preserves hermes reasoning / reasoning_content, keeping it out of the transcript', () => {
+    const t = parseTrace(
+      JSON.stringify({
+        role: 'assistant',
+        content: 'Here is the page.',
+        reasoning: 'Let me load the frontend-design skill first.',
+        reasoning_content: 'Let me load the frontend-design skill first.',
+      }),
+    )
+    expect(t.messages[0].reasoning).toBe('Let me load the frontend-design skill first.')
+    expect(t.messages[0].content).toBe('Here is the page.')
+    expect(t.text()).not.toContain('frontend-design')
+  })
+
+  it('falls back to reasoning_content when reasoning is null or blank', () => {
+    const t = parseTrace(
+      JSON.stringify({
+        role: 'assistant',
+        content: 'ok',
+        reasoning: null,
+        reasoning_content: 'the real thinking',
+      }),
+    )
+    expect(t.messages[0].reasoning).toBe('the real thinking')
+  })
+
+  it('leaves reasoning undefined when the agent exports none', () => {
+    const t = parseTrace(JSON.stringify({ role: 'assistant', content: 'ok' }))
+    expect(t.messages[0].reasoning).toBeUndefined()
+  })
+
   it('tolerates blank lines and non-JSON banner noise', () => {
     const noisy = 'loongsuite bootstrap started\n\n' + fixture('unrelated.jsonl')
     const t = parseTrace(noisy)

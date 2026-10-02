@@ -22,6 +22,196 @@ export function parseTrace(jsonl: string): Trace {
   return buildTrace(raw)
 }
 
+/**
+ * Parse an opencode `run --format json` dump into a normalized {@link Trace}.
+ *
+ * VERIFY-CLI: opencode emits JSON events for a non-interactive run, but the exact
+ * envelope was not confirmable offline. This parser is deliberately tolerant —
+ * it accepts a single JSON document (array, `{messages:[…]}`) or an NDJSON event
+ * stream, maps recognizable opencode message/part events into OpenAI-shaped
+ * records, and otherwise hands the raw records to {@link buildTrace} (which is
+ * already tolerant of OpenAI-shaped input). One place to pin exactly once a real
+ * opencode trace is observed.
+ */
+export function parseOpencodeTrace(text: string): Trace {
+  const records = parseJsonStream(text)
+  const mapped = records.map(mapOpencodeEvent).filter((r): r is unknown => r != null)
+  return buildTrace(mapped.length ? mapped : records)
+}
+
+/**
+ * Parse an acpx `--format json` (ACP NDJSON) stream into a normalized Trace.
+ *
+ * Pinned to the real envelope shapes captured from hermes 0.18.2 + acpx 0.12.1
+ * (TODO §VI). The stream is JSON-RPC: the user prompt echoes in a `session/prompt`
+ * request, and everything the agent emits arrives as `session/update`
+ * notifications keyed by `params.update.sessionUpdate`:
+ *   - `agent_message_chunk` — streamed assistant text (`update.content.text`),
+ *     concatenated into one assistant message per turn.
+ *   - `agent_thought_chunk` — reasoning; kept on the assistant message's
+ *     `reasoning` field but never merged into `content`, so it stays out of
+ *     `finalMessage` and the graded transcript while remaining assertable. For
+ *     hermes this is the ONLY signal that a preloaded skill fired (TODO §5).
+ *   - `tool_call` — `{ kind, title, toolCallId, content:[{content:{text}}] }`;
+ *     mapped to an assistant `tool_calls` entry (name = `kind`, e.g. `execute`).
+ *   - `tool_call_update` — the same `toolCallId` with `status` + result content;
+ *     mapped to a `tool` message that {@link buildTrace} attaches back by id.
+ *   - `available_commands_update` / `usage_update` / resume+result frames — noise.
+ *
+ * VERIFY-CLI: the assistant/thought/tool shapes are confirmed for hermes' ACP
+ * adapter; other acpx agents (pi/openclaw) may label `kind`/`title` differently.
+ */
+export function parseAcpxTrace(text: string): Trace {
+  const records = parseJsonStream(text)
+  const synth: unknown[] = []
+  let assistantText = ''
+  let thoughtText = ''
+  let toolCalls: unknown[] = []
+  const toolResults: unknown[] = []
+
+  const flushAssistant = () => {
+    if (!assistantText.trim() && toolCalls.length === 0 && !thoughtText.trim()) return
+    const msg: Record<string, unknown> = { role: 'assistant', content: assistantText }
+    if (toolCalls.length) msg.tool_calls = toolCalls
+    // Thoughts are kept as `reasoning` (never merged into `content`, so they stay
+    // out of the graded transcript) — for hermes this is the only skill-firing
+    // signal there is (TODO §5).
+    if (thoughtText.trim()) msg.reasoning = thoughtText
+    synth.push(msg)
+    assistantText = ''
+    thoughtText = ''
+    toolCalls = []
+  }
+
+  for (const rec of records) {
+    if (!rec || typeof rec !== 'object') continue
+    const obj = rec as Record<string, unknown>
+    const params = obj.params as Record<string, unknown> | undefined
+
+    if (obj.method === 'session/prompt') {
+      const promptText = acpText((params?.prompt as unknown) ?? undefined)
+      if (promptText.trim()) synth.push({ role: 'user', content: promptText })
+      continue
+    }
+    if (obj.method !== 'session/update') continue
+    const update = params?.update as Record<string, unknown> | undefined
+    if (!update) continue
+
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk':
+        assistantText += acpText(update.content)
+        break
+      case 'agent_thought_chunk':
+        thoughtText += acpText(update.content)
+        break
+      case 'tool_call':
+        toolCalls.push({
+          id: typeof update.toolCallId === 'string' ? update.toolCallId : undefined,
+          function: {
+            name: acpToolName(update),
+            arguments: {
+              title: update.title,
+              kind: update.kind,
+              text: acpText(update.content),
+            },
+          },
+        })
+        break
+      case 'tool_call_update':
+        toolResults.push({
+          role: 'tool',
+          tool_call_id: typeof update.toolCallId === 'string' ? update.toolCallId : undefined,
+          content: acpText(update.content),
+        })
+        break
+      // available_commands_update, usage_update: ignored. (The former advertises
+      // the agent's slash/skill commands — capture it when forced skill
+      // invocation lands, TODO §8.)
+    }
+  }
+
+  flushAssistant()
+  for (const r of toolResults) synth.push(r)
+  return buildTrace(synth.length ? synth : records)
+}
+
+/**
+ * Flatten ACP `content` into text. It appears as `{text}`, a `{content:{text}}`
+ * wrapper, or an array of either (tool_call content is
+ * `[{content:{text},type:'content'}]`; a prompt is `[{type:'text',text}]`).
+ */
+function acpText(content: unknown): string {
+  if (!content) return ''
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) return content.map(acpText).join('')
+  if (typeof content === 'object') {
+    const c = content as Record<string, unknown>
+    if (typeof c.text === 'string') return c.text
+    if (c.content != null) return acpText(c.content)
+  }
+  return ''
+}
+
+/** Tool name for an ACP tool_call: the machine `kind` (e.g. `execute`), else the title's head. */
+function acpToolName(update: Record<string, unknown>): string {
+  if (typeof update.kind === 'string' && update.kind) return update.kind
+  if (typeof update.title === 'string' && update.title) return update.title.split(':')[0].trim()
+  return 'tool'
+}
+
+/** Parse either a single JSON document (array/object) or an NDJSON stream. */
+function parseJsonStream(text: string): unknown[] {
+  const trimmed = text.trim()
+  if (!trimmed) return []
+  // Try the whole payload as one JSON document first.
+  try {
+    const doc = JSON.parse(trimmed)
+    return Array.isArray(doc) ? doc : [doc]
+  } catch {
+    /* fall through to line-by-line NDJSON */
+  }
+  const out: unknown[] = []
+  for (const line of trimmed.split('\n')) {
+    const l = line.trim()
+    if (!l) continue
+    try {
+      out.push(JSON.parse(l))
+    } catch {
+      /* skip non-JSON banner lines */
+    }
+  }
+  return out
+}
+
+/**
+ * Map one opencode event to an OpenAI-shaped message record, or null to defer to
+ * buildTrace's own tolerance. Recognizes a `{role, parts:[…]}` message where
+ * parts are `{type:'text',text}` / `{type:'tool',tool,input,output,id}`.
+ */
+function mapOpencodeEvent(rec: unknown): unknown {
+  if (!rec || typeof rec !== 'object') return null
+  const obj = rec as Record<string, unknown>
+  const parts = obj.parts
+  if (typeof obj.role !== 'string' || !Array.isArray(parts)) return null
+
+  const textChunks: string[] = []
+  const toolCalls: unknown[] = []
+  for (const part of parts) {
+    if (!part || typeof part !== 'object') continue
+    const p = part as Record<string, unknown>
+    if (p.type === 'text' && typeof p.text === 'string') textChunks.push(p.text)
+    else if (p.type === 'tool' || p.type === 'tool_call' || typeof p.tool === 'string') {
+      toolCalls.push({
+        id: typeof p.id === 'string' ? p.id : undefined,
+        function: { name: p.tool ?? p.name, arguments: p.input ?? p.arguments ?? {} },
+      })
+    }
+  }
+  const out: Record<string, unknown> = { role: obj.role, content: textChunks.join('\n') }
+  if (toolCalls.length) out.tool_calls = toolCalls
+  return out
+}
+
 /** Build a Trace from already-parsed records (used by tests with recorded data). */
 export function buildTrace(raw: unknown[]): Trace {
   const records = raw.flatMap(expandRecord)
@@ -76,6 +266,12 @@ function toMessage(rec: unknown): TraceMessage | null {
   if (toolCalls.length) msg.toolCalls = toolCalls
   if (typeof obj.tool_call_id === 'string') msg.toolCallId = obj.tool_call_id
   if (typeof obj.name === 'string' && role === 'tool') msg.toolName = obj.name
+  // hermes exports both `reasoning` and `reasoning_content` (same text); ACP's
+  // synthesized records use `reasoning`. First non-empty wins.
+  const reasoning = [obj.reasoning, obj.reasoning_content].find(
+    (v): v is string => typeof v === 'string' && v.trim() !== '',
+  )
+  if (reasoning) msg.reasoning = reasoning
   return msg
 }
 

@@ -35,13 +35,15 @@ export function activeDetector(): SkillDetector {
 /**
  * Detect whether a given skill was invoked within a trace.
  *
- * ⚠️ §11 UNVERIFIED ASSUMPTION. The design doc flags that we do not yet know,
- * against a real hermes container, which tool_call signals "this skill fired"
- * (is there a dedicated `skill_view` call? does the skill name appear in the
- * arguments?). This function centralizes that guess so there is exactly one
- * place to fix once we can observe a real trace. Everything downstream
- * (`toHaveBeenCalled`) depends only on this contract, not on the heuristic —
- * and a suite can replace the guess wholesale via {@link setSkillDetector}.
+ * ⚠️ §11 PARTIALLY VERIFIED. The acpx/hermes trace *shape* is now pinned (TODO
+ * §VI): a tool call surfaces as an ACP `tool_call` whose machine `kind` becomes
+ * {@link ToolCall.name} (e.g. `execute`) and whose human `title` + payload land
+ * in {@link ToolCall.arguments} (`title` / `text`). What a *skill* firing looks
+ * like specifically — a dedicated tool `kind`, or the skill name in the title —
+ * still needs a real skill-firing trace to pin. This heuristic therefore checks
+ * both the classic `skill_view`-style name and the ACP title/text, and stays the
+ * single place to fix; everything downstream (`toHaveBeenCalled`) depends only on
+ * this contract, and a suite can replace it wholesale via {@link setSkillDetector}.
  */
 export function detectSkillInvocations(trace: Trace, skillName: string): ToolCall[] {
   const needle = skillName.toLowerCase()
@@ -65,7 +67,9 @@ export function detectSkillInvocations(trace: Trace, skillName: string): ToolCal
 }
 
 function argMentions(call: ToolCall, needle: string): boolean {
-  for (const key of ['name', 'skill', 'skill_name', 'id', 'path']) {
+  // `title` / `text` are the ACP tool_call fields (TODO §VI); the rest cover
+  // OpenAI-style skill-machinery tool calls.
+  for (const key of ['name', 'skill', 'skill_name', 'id', 'path', 'title', 'text']) {
     const v = call.arguments[key]
     if (typeof v === 'string' && v.toLowerCase().includes(needle)) return true
   }

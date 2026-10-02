@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { cp, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { ExecOptions, ExecResult, Runtime, RuntimeEnv } from './types.js'
+import type { AgentHome, ExecOptions, ExecResult, Runtime, RuntimeEnv } from './types.js'
 
 /**
  * Local runtime (§3): runs the installed agent binary directly on the host in a
@@ -17,14 +17,14 @@ import type { ExecOptions, ExecResult, Runtime, RuntimeEnv } from './types.js'
 export class LocalRuntime implements Runtime {
   readonly kind = 'local' as const
 
-  async boot(id: string): Promise<RuntimeEnv> {
+  async boot(id: string, home: AgentHome): Promise<RuntimeEnv> {
     const root = await mkdtemp(join(tmpdir(), `agentfoo-${id}-`))
     const workspacePath = join(root, 'workspace')
-    const agentHome = join(root, 'hermes-home')
+    const agentHome = join(root, 'agent-home')
     const skillsPath = join(agentHome, 'skills')
     await mkdir(workspacePath, { recursive: true })
     await mkdir(skillsPath, { recursive: true })
-    return new LocalEnv(id, root, workspacePath, skillsPath, agentHome)
+    return new LocalEnv(id, root, workspacePath, skillsPath, agentHome, home.homeEnvVar)
   }
 }
 
@@ -35,6 +35,7 @@ class LocalEnv implements RuntimeEnv {
     readonly workspacePath: string,
     readonly skillsPath: string,
     readonly agentHome: string,
+    private readonly homeEnvVar: string,
   ) {}
 
   exec(argv: string[], opts: ExecOptions = {}): Promise<ExecResult> {
@@ -44,7 +45,7 @@ class LocalEnv implements RuntimeEnv {
         cwd: opts.cwd ?? this.workspacePath,
         env: {
           ...process.env,
-          HERMES_HOME: this.agentHome,
+          [this.homeEnvVar]: this.agentHome,
           ...opts.env,
         },
       })

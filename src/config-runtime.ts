@@ -1,4 +1,5 @@
 import type { AgentConfig, AgentfooConfig, JudgeConfig } from './types.js'
+import { providerMeta } from './providers.js'
 
 /**
  * Config as seen from *inside* a test worker.
@@ -39,15 +40,81 @@ export function loadConfig(): ResolvedConfig {
   return cached
 }
 
+/**
+ * Which agent kind a fixture that calls `bootAgent()` without a kind should boot.
+ *
+ * Resolution order:
+ *  1. the CLI's `-a/--agent` (via `AGENTFOO_AGENT`) — lets one spec set be pointed
+ *     at a different agent without editing fixtures;
+ *  2. otherwise the single entry in `agents`, when there is exactly one.
+ *
+ * Anything else throws, because guessing would silently run the suite against the
+ * wrong agent — a failure that looks like a skill regression. A kind that isn't in
+ * `agents` is rejected too (typo protection), except when no agents are configured
+ * at all, which is the legitimate shape for a `registerAgent` bring-your-own agent
+ * that needs no config block.
+ */
+export function selectedAgentKind(): string {
+  const configured = Object.keys(loadConfig().agents)
+  const requested = process.env.AGENTFOO_AGENT?.trim()
+
+  if (requested) {
+    if (configured.length > 0 && !configured.includes(requested)) {
+      throw new Error(
+        `-a/--agent: no agent named "${requested}" in agentfoo.config.ts. ` +
+          `Configured agents: ${configured.join(', ')}.`,
+      )
+    }
+    return requested
+  }
+
+  if (configured.length === 1) return configured[0]
+
+  if (configured.length === 0) {
+    throw new Error(
+      'bootAgent() needs an agent kind: agentfoo.config.ts declares no `agents`. ' +
+        'Add one, pass the kind explicitly (bootAgent("hermes")), or select one with `-a <kind>`.',
+    )
+  }
+
+  throw new Error(
+    `bootAgent() is ambiguous: agentfoo.config.ts declares ${configured.length} agents ` +
+      `(${configured.join(', ')}). Select one with \`-a <kind>\` or pass the kind explicitly ` +
+      '(bootAgent("hermes")).',
+  )
+}
+
 /** Resolve the effective config for one named agent (config default + overrides). */
 export function resolveAgentConfig(name: string, override: AgentConfig = {}): AgentConfig {
   const base = loadConfig().agents[name] ?? {}
-  return {
+  const merged: AgentConfig = {
     runtime: 'docker',
     memory: false,
     ...base,
     ...stripUndefined(override),
   }
+  return applyProviderDefaults(merged)
+}
+
+/**
+ * Fill in a known provider's conventional endpoint + key env var so a bare
+ * `provider: 'glm'` (or a `glm/…` model prefix) works without hand-writing the
+ * base URL or `passEnv`. Explicit values always win; unknown providers pass
+ * through untouched.
+ */
+function applyProviderDefaults(config: AgentConfig): AgentConfig {
+  const provider =
+    config.provider ??
+    (config.model?.includes('/') ? config.model.slice(0, config.model.indexOf('/')) : undefined)
+  const meta = provider ? providerMeta(provider) : undefined
+  if (!meta) return config
+
+  const out = { ...config }
+  if (!out.baseUrl && meta.apiBase) out.baseUrl = meta.apiBase
+  if ((!out.passEnv || out.passEnv.length === 0) && meta.apiKeyEnv.length) {
+    out.passEnv = [...meta.apiKeyEnv]
+  }
+  return out
 }
 
 function stripUndefined<T extends object>(obj: T): Partial<T> {

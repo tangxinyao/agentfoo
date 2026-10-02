@@ -60,15 +60,33 @@ export function defineConfig(config: AgentfooConfig = {}): UserConfig {
       env: {
         AGENTFOO_CONFIG: JSON.stringify(agentfoo),
         // Shared across workers + reporter so all artifacts land in one dir (§9).
-        AGENTFOO_RUN_ID: runId(),
+        AGENTFOO_RUN_ID: resolveRunId(),
+        // Which agent `bootAgent()` (no explicit kind) selects, from the CLI's
+        // `-a/--agent`. Forwarded explicitly rather than relying on ambient
+        // inheritance so it reaches workers under every vitest pool.
+        ...(process.env.AGENTFOO_AGENT ? { AGENTFOO_AGENT: process.env.AGENTFOO_AGENT } : {}),
       },
     },
   }
 }
 
-/** ISO-ish, filesystem-safe timestamp, e.g. 2026-07-10T18-02-11. */
-function runId(): string {
-  return new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, '')
+/**
+ * The run id for this invocation, pinned into the *main* process env as well as
+ * the workers'.
+ *
+ * `test.env` only reaches the worker processes, so a run id created inline here
+ * left the reporter (which runs in the main process) reading an unset
+ * `AGENTFOO_RUN_ID` and falling back to `runs/local` — it then wrote report.json
+ * and printed a "Logs …" path pointing at a directory containing none of the
+ * traces the workers had just written under `runs/<timestamp>/`. Setting it on
+ * `process.env` first makes both sides agree, and honours an id injected by CI.
+ */
+function resolveRunId(): string {
+  process.env.AGENTFOO_RUN_ID ??= new Date()
+    .toISOString()
+    .replace(/:/g, '-')
+    .replace(/\..+$/, '')
+  return process.env.AGENTFOO_RUN_ID
 }
 
 export type { AgentfooConfig }

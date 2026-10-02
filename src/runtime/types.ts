@@ -31,7 +31,17 @@ export interface RuntimeEnv {
   teardown(): Promise<void>
 }
 
+/** Per-agent home layout the runtime needs to expose the CLI's config/session dir. */
+export interface AgentHome {
+  /**
+   * Env var the runtime sets to the agent's home dir on every exec, so each CLI
+   * finds its isolated config/session store (hermes: `HERMES_HOME`; opencode:
+   * `XDG_CONFIG_HOME`). Supplied by the agent registry.
+   */
+  homeEnvVar: string
+}
+
 export interface Runtime {
   readonly kind: 'local' | 'docker'
-  boot(id: string): Promise<RuntimeEnv>
+  boot(id: string, home: AgentHome): Promise<RuntimeEnv>
 }
