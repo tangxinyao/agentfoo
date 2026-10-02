@@ -107,6 +107,12 @@ export interface TraceMessage {
   reasoning?: string
 }
 
+/** One entry from an agent's advertised slash/skill command list (ACP `available_commands_update`). */
+export interface AvailableCommand {
+  name: string
+  description?: string
+}
+
 /**
  * Normalized conversation trace, shaped after an OpenAI chat transcript
  * (§7 / §10 — we deliberately do not invent a new schema). Every agent's wire
@@ -125,7 +131,19 @@ export interface Trace {
    * this layer drops.
    */
   raw: unknown[]
-  /** Full rendered transcript, used as the default target for `toSatisfy`. */
+  /**
+   * The agent's advertised slash/skill commands, when the wire envelope carries
+   * one (ACP `available_commands_update` — TODO §P1). Undefined for an envelope
+   * that has no such concept (opencode) or a stream that never sent one.
+   */
+  availableCommands?: AvailableCommand[]
+  /**
+   * Full rendered transcript, tool results included. `toSatisfy` grades this only
+   * with `{ target: 'transcript' }` — by default it grades {@link finalMessage},
+   * because the transcript also carries whatever files the agent read, and for
+   * agents that load a skill by reading SKILL.md (pi, openclaw) that means the
+   * skill's own instructions end up graded as if they were the answer.
+   */
   text(): string
 }
 
@@ -137,11 +155,75 @@ export interface RubricCriterion {
 
 export type Rubric = string | RubricCriterion[]
 
+/** What part of a {@link Trace} `toSatisfy` hands to the judge. */
+export type SatisfyTarget = 'final' | 'transcript'
+
 export interface SatisfyOptions {
   /** Pass threshold in [0,1] for weighted rubrics. Default 1 for single. */
   threshold?: number
   /** Override judge model for this single call (syntactic sugar, §6). */
   model?: string
+  /**
+   * Only applies when the received value is a {@link Trace}. `'final'` (default)
+   * grades `trace.finalMessage`; `'transcript'` grades `trace.text()`, the whole
+   * rendered conversation including tool calls and their results. Opt into the
+   * transcript only when the rubric is about the *process* (which tools were
+   * used, in what order) — it also contains any SKILL.md the agent read, which a
+   * judge will happily credit as part of the answer.
+   */
+  target?: SatisfyTarget
+  /**
+   * Grade this many times and aggregate (default: `judge.samples` from the
+   * config, else 1). An LLM judge is not deterministic — the same answer and
+   * rubric graded three times by deepseek-flash came back ✗✗✓ / ✓✓✓ / ✗✓✗ — so a
+   * single grading can't separate a real change from noise. The score becomes
+   * the mean, each criterion is met by majority, and the record keeps every
+   * sample's score and the standard deviation.
+   */
+  samples?: number
+}
+
+/**
+ * One trigger assertion (`expect(skill).toHaveBeenCalled()` or its `.not`), as
+ * persisted to `trigger-<n>.json`. Kept apart from the test's pass/fail because
+ * a test can fail on its rubric after triggering correctly — and the
+ * description-optimization loop needs exactly this signal: did the skill fire,
+ * and should it have.
+ */
+export interface TriggerRecord {
+  test: string
+  index: number
+  skill: string
+  /** Whether the skill was detected as invoked. */
+  called: boolean
+  /** Whether the assertion expected it to be (`toHaveBeenCalled` vs `.not`). */
+  expected: boolean
+  recordedAt: string
+}
+
+/**
+ * One `toSatisfy` grading, as persisted to `judge-<n>.json` next to the test's
+ * turn artifacts and summarized into `report.json`.
+ */
+export interface JudgeRecord {
+  /** vitest's `currentTestName` ("describe > it"). */
+  test: string
+  /** 1-based index of this grading within the test. */
+  index: number
+  model: string
+  /** `'string'` when a plain string was graded rather than a Trace. */
+  target: SatisfyTarget | 'string'
+  threshold: number
+  score: number
+  passed: boolean
+  breakdown: JudgeResult['breakdown']
+  /** Number of gradings aggregated into this record (1 unless `samples` was set). */
+  samples: number
+  /** Every sample's score, in order; `score` is their mean. */
+  scores: number[]
+  /** Population standard deviation of `scores` (0 for a single sample). */
+  stdev: number
+  gradedAt: string
 }
 
 /** Pass-decision strategy for {@link retry} (§5). */
@@ -162,7 +244,14 @@ export interface JudgeResult {
   score: number
   threshold: number
   /** Per-criterion breakdown for artifact/debugging output. */
-  breakdown: Array<{ criteria: string; weight: number; met: boolean; reason: string }>
+  breakdown: Array<{
+    criteria: string
+    weight: number
+    met: boolean
+    reason: string
+    /** Fraction of samples that judged this criterion met; only set when `samples > 1`. */
+    metRate?: number
+  }>
 }
 
 export interface JudgeConfig {
@@ -192,6 +281,8 @@ export interface JudgeConfig {
    * deliberately roomy. Lower it only for a known non-reasoning judge.
    */
   maxTokens?: number
+  /** Default for {@link SatisfyOptions.samples}: how many times each `toSatisfy` grades. Default 1. */
+  samples?: number
 }
 
 export interface AgentfooConfig {
@@ -205,6 +296,14 @@ export interface AgentfooConfig {
    * Default 300_000 (5 min).
    */
   timeout?: number
+  /**
+   * How many `test.concurrent` cases may run at once within a spec file, and the
+   * default size of {@link createAgentPool}. Default 1: everything serial, the
+   * safe setting for containers and rate-limited APIs. Raise it only together with
+   * a pool — concurrent tests sharing one file-scoped agent would interleave turns
+   * in a single session. Size it to host memory (a pi container is ~270MB).
+   */
+  concurrency?: number
   /** vitest passthrough. */
   setupFiles?: string[]
   include?: string[]

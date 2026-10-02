@@ -1,13 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { expect } from 'vitest'
 import type { AgentConfig, AgentKind } from './types.js'
-import type { Runtime } from './runtime/types.js'
+import type { Runtime, RuntimeEnv } from './runtime/types.js'
 import { LocalRuntime } from './runtime/local.js'
 import { DockerRuntime, bundledDockerfile } from './runtime/docker.js'
 import type { Agent } from './agent/types.js'
 import { agentSpec, type AgentSpec } from './agent/registry.js'
-import { resolveAgentConfig, selectedAgentKind } from './config-runtime.js'
-import { recordTestArtifacts } from './artifacts.js'
+import { loadConfig, resolveAgentConfig, selectedAgentKind } from './config-runtime.js'
+import { recordAgentVersion, recordTestArtifacts } from './artifacts.js'
+import { progress } from './progress.js'
+import { resolveSkillOverride } from './agent/shared.js'
 
 /**
  * Boot an agent instance for a fixture (§4). Test authors call this inside a
@@ -39,12 +41,31 @@ export async function bootAgent(
 ): Promise<Agent> {
   const explicitKind = typeof kindOrOverride === 'string' ? kindOrOverride : undefined
   const override = typeof kindOrOverride === 'object' ? kindOrOverride : maybeOverride
+  return boot(explicitKind, override, globalTestName)
+}
+
+/**
+ * The running test's name from vitest's *global* expect state. Correct as long as
+ * a worker runs one test at a time — the default. Under `test.concurrent` it names
+ * whichever test started last, which is why {@link createAgentPool} binds each
+ * checked-out agent to its test explicitly instead.
+ */
+function globalTestName(): string | undefined {
+  return expect.getState().currentTestName ?? undefined
+}
+
+async function boot(
+  explicitKind: AgentKind | undefined,
+  override: AgentConfig,
+  testName: () => string | undefined,
+): Promise<Agent> {
   const kind = explicitKind ?? selectedAgentKind()
   const spec = agentSpec(kind)
   const config = resolveAgentConfig(kind, override)
   const runtime = selectRuntime(config, spec)
   const id = `${kind}-${randomUUID().slice(0, 8)}`
   const env = await runtime.boot(id, { homeEnvVar: spec.homeEnvVar })
+  if (runtime.kind === 'local' && spec.versionArgv) await noteLocalVersion(kind, spec.versionArgv, env)
 
   let turn = 0
   const agent = spec.create({
@@ -53,19 +74,153 @@ export async function bootAgent(
     sourceTag: `agentfoo-${id}`,
     // Lets the adapter start a fresh session at each test boundary (§4) while
     // staying vitest-agnostic itself — the vitest dependency lives here.
-    currentTest: () => expect.getState().currentTestName ?? undefined,
+    currentTest: testName,
     onTrace: ({ trace, sessionJsonl }) => {
       turn++
-      const testName = expect.getState().currentTestName ?? 'unknown'
       try {
-        recordTestArtifacts(testName, { trace, sessionJsonl, turn })
+        recordTestArtifacts(testName() ?? 'unknown', { trace, sessionJsonl, turn })
       } catch {
         // Artifact writing must never fail a test.
       }
     },
   })
+  // Candidate skills (`agentfoo optimize`) replace the real dir here, once for
+  // every adapter, so specs keep loading the path they always load.
+  const loadSkill = agent.loadSkill.bind(agent)
+  agent.loadSkill = async (hostPath, opts) => loadSkill(await resolveSkillOverride(hostPath), opts)
   await agent.init()
   return agent
+}
+
+/** The subset of a vitest test context {@link testNameOf} needs. */
+interface TaskLike {
+  name: string
+  suite?: (TaskLike & { filepath?: string }) | undefined
+}
+
+/**
+ * A test's name the way vitest builds `currentTestName` ("describe > it", no file
+ * part) — the key judge records and artifact directories are filed under. Derived
+ * from the test's own task object, so it stays correct under `test.concurrent`.
+ */
+export function testNameOf(task: TaskLike): string {
+  const names = [task.name]
+  for (let s = task.suite; s && !('filepath' in s && s.filepath); s = s.suite) names.unshift(s.name)
+  return names.join(' > ')
+}
+
+export interface AgentPoolOptions {
+  /**
+   * Upper bound on live agents (containers). Defaults to the config's
+   * `concurrency`. Size it to host memory: a pi container is ~270MB, openclaw ~850MB.
+   */
+  size?: number
+  /** Pin the agent kind; omit to take it from `-a/--agent` like {@link bootAgent}. */
+  kind?: AgentKind
+  override?: AgentConfig
+}
+
+export interface AgentPool {
+  /**
+   * Check out an agent for one test, booting a new one while under `size`,
+   * otherwise waiting for a release. The agent is bound to `testName` (use
+   * {@link testNameOf}) for session isolation and artifact filing until released.
+   */
+  acquire(testName: string): Promise<Agent>
+  release(agent: Agent): void
+  /** Tear down every agent the pool booted. */
+  teardown(): Promise<void>
+}
+
+/**
+ * A bounded set of agents shared by concurrently running tests (TODO §P2.5).
+ *
+ * One agent per spec file means a 28-case dataset runs one case at a time. With a
+ * pool, `test.concurrent` cases each borrow their own agent — and the pool binds
+ * the borrower's name to it, because the global expect state that
+ * {@link bootAgent} relies on names only the most recently started test once
+ * tests overlap. Skills loaded into a pooled agent stay loaded across borrowers
+ * (`loadSkill` dedupes by name), as with a file-scoped agent.
+ *
+ * ```ts
+ * pool: [async ({}, use) => {
+ *   const pool = createAgentPool({ size: 2 })
+ *   await use(pool)
+ *   await pool.teardown()
+ * }, { scope: 'file' }],
+ * agent: async ({ pool, task }, use) => {
+ *   const agent = await pool.acquire(testNameOf(task))
+ *   await use(agent)
+ *   pool.release(agent)
+ * },
+ * ```
+ *
+ * Inside concurrent tests, assert with the context's `expect` (`async ({ expect }) =>`),
+ * as vitest requires for concurrency — the judge records its test from that.
+ */
+export function createAgentPool(opts: AgentPoolOptions = {}): AgentPool {
+  const size = opts.size ?? loadConfig().concurrency
+  if (!(size >= 1)) throw new Error(`createAgentPool: size must be >= 1, got ${size}`)
+  const all: Agent[] = []
+  const idle: Agent[] = []
+  const boundTo = new Map<Agent, { name: string | undefined }>()
+  const waiters: Array<(a: Agent) => void> = []
+  let booting = 0
+
+  const checkout = (agent: Agent, testName: string): Agent => {
+    boundTo.get(agent)!.name = testName
+    return agent
+  }
+
+  return {
+    async acquire(testName) {
+      const free = idle.pop()
+      if (free) return checkout(free, testName)
+      if (all.length + booting < size) {
+        booting++
+        const binding: { name: string | undefined } = { name: testName }
+        try {
+          const agent = await boot(opts.kind, opts.override ?? {}, () => binding.name)
+          all.push(agent)
+          boundTo.set(agent, binding)
+          return agent
+        } finally {
+          booting--
+        }
+      }
+      const agent = await new Promise<Agent>((resolve) => waiters.push(resolve))
+      return checkout(agent, testName)
+    },
+    release(agent) {
+      const binding = boundTo.get(agent)
+      if (!binding) throw new Error('createAgentPool: release() of an agent this pool did not hand out')
+      binding.name = undefined
+      const next = waiters.shift()
+      if (next) next(agent)
+      else idle.push(agent)
+    },
+    async teardown() {
+      await Promise.all(all.map((a) => a.teardown()))
+      all.length = 0
+      idle.length = 0
+    },
+  }
+}
+
+/**
+ * Under `--local` the agent is whatever the host has installed, not the
+ * Dockerfile's pin — and the two drift (pi was 9 minors apart once, with a real
+ * bug in the gap). Record the version; never compare or enforce it.
+ */
+async function noteLocalVersion(kind: string, argv: string[], env: RuntimeEnv): Promise<void> {
+  try {
+    const { stdout, stderr, exitCode } = await env.exec(argv)
+    const version = (exitCode === 0 ? stdout || stderr : `unknown (exit ${exitCode})`).trim().split('\n')[0]
+    recordAgentVersion(kind, version)
+    progress(`  local ${kind}: ${version}`)
+  } catch {
+    // version reporting must never break a run
+  }
 }
 
 function selectRuntime(config: AgentConfig, spec: AgentSpec): Runtime {

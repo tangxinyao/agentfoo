@@ -165,7 +165,19 @@ export async function judge(
   threshold: number,
 ): Promise<JudgeResult> {
   const criteria = normalizeRubric(rubric)
+  const breakdown = await scoreCriteria(target, criteria, resolveRoute(config))
 
+  const totalWeight = criteria.reduce((s, c) => s + (c.weight ?? 1), 0)
+  const metWeight = breakdown.reduce((s, b) => s + (b.met ? b.weight : 0), 0)
+  const score = totalWeight === 0 ? 0 : metWeight / totalWeight
+
+  return { passed: score >= threshold, score, threshold, breakdown }
+}
+
+type Route = { spec: ProviderSpec; baseUrl: string; model: string; apiKey: string; maxTokens: number }
+
+/** Resolve a `provider/model` config into everything needed to send one request. */
+function resolveRoute(config: JudgeConfig): Route {
   const providerName = config.provider ?? providerOf(config.model) ?? DEFAULT_PROVIDER
   const spec = PROVIDERS[providerName]
   if (!spec) {
@@ -175,24 +187,46 @@ export async function judge(
         `Set judge.model to a "<provider>/<model>" string, or judge.provider explicitly.`,
     )
   }
-
-  const apiKey = resolveApiKey(config, spec, providerName)
-  const baseUrl = config.baseUrl ?? spec.defaultBaseUrl
-  const model = stripProvider(config.model)
-  const maxTokens = config.maxTokens ?? DEFAULT_MAX_TOKENS
-  const breakdown = await scoreCriteria(target, criteria, {
+  return {
     spec,
-    baseUrl,
-    model,
-    apiKey,
-    maxTokens,
+    apiKey: resolveApiKey(config, spec, providerName),
+    baseUrl: config.baseUrl ?? spec.defaultBaseUrl,
+    model: stripProvider(config.model),
+    maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
+  }
+}
+
+/** One system+user request through a resolved route; returns the model's (JSON) text. */
+async function send(route: Route, system: string, user: string): Promise<string> {
+  const { spec, baseUrl, model, apiKey, maxTokens } = route
+  const req = spec.request({ baseUrl, model, system, user, apiKey, maxTokens })
+  const res = await fetch(req.url, {
+    method: 'POST',
+    headers: req.headers,
+    body: JSON.stringify(req.body),
   })
 
-  const totalWeight = criteria.reduce((s, c) => s + (c.weight ?? 1), 0)
-  const metWeight = breakdown.reduce((s, b) => s + (b.met ? b.weight : 0), 0)
-  const score = totalWeight === 0 ? 0 : metWeight / totalWeight
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`Judge API call failed (${res.status}): ${body.slice(0, 500)}`)
+  }
 
-  return { passed: score >= threshold, score, threshold, breakdown }
+  const output = spec.extractOutput(await res.json())
+  assertUsableOutput(output, model, maxTokens)
+  return output.text
+}
+
+/**
+ * A single JSON-mode completion through the judge's provider routing, for other
+ * model roles that want the same endpoints, keys and failure messages — the
+ * `agentfoo suggest` optimizer. `system` must mention JSON (OpenAI-dialect JSON
+ * mode requires it). Returns the parsed object.
+ */
+export async function completeJson<T = unknown>(config: JudgeConfig, system: string, user: string): Promise<T> {
+  const text = await send(resolveRoute(config), system, user)
+  const match = text.match(/\{[\s\S]*\}/)
+  if (!match) throw new Error(`Model returned no JSON object: ${text.slice(0, 300)}`)
+  return JSON.parse(match[0]) as T
 }
 
 /** Find the API key from the configured (or provider-default) env var(s). */
@@ -211,13 +245,7 @@ function resolveApiKey(config: JudgeConfig, spec: ProviderSpec, providerName: st
 async function scoreCriteria(
   target: string,
   criteria: RubricCriterion[],
-  route: {
-    spec: ProviderSpec
-    baseUrl: string
-    model: string
-    apiKey: string
-    maxTokens: number
-  },
+  route: Route,
 ): Promise<JudgeResult['breakdown']> {
   const system =
     'You are a strict but fair grader for AI agent test assertions. ' +
@@ -232,29 +260,25 @@ async function scoreCriteria(
     `# Criteria (grade each in order)\n` +
     criteria.map((c, i) => `${i + 1}. ${c.criteria}`).join('\n')
 
-  const { spec, baseUrl, model, apiKey, maxTokens } = route
-  const req = spec.request({ baseUrl, model, system, user, apiKey, maxTokens })
-  const res = await fetch(req.url, {
-    method: 'POST',
-    headers: req.headers,
-    body: JSON.stringify(req.body),
-  })
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '')
-    throw new Error(`Judge API call failed (${res.status}): ${body.slice(0, 500)}`)
+  // A verdict list that is short, or has blank entries, used to be read as
+  // "unmet" for every missing criterion — which failed a sound answer on four
+  // negative criteria the judge simply never filled in (seen once in 272 verdicts
+  // on deepseek-v4-pro). An incomplete grading is a judge fault, not a verdict:
+  // ask again once, then fail loudly.
+  let parsed = parseJudgeJson(await send(route, system, user))
+  if (incomplete(parsed, criteria.length)) parsed = parseJudgeJson(await send(route, system, user))
+  if (incomplete(parsed, criteria.length)) {
+    const filled = parsed.filter((p) => p.reason.trim()).length
+    throw new Error(
+      `Judge "${route.model}" returned ${filled} usable verdicts for ${criteria.length} criteria, twice. ` +
+        'Not grading on a partial answer — rerun, or split the rubric into fewer criteria per call.',
+    )
   }
-
-  const data = await res.json()
-  const output = spec.extractOutput(data)
-  assertUsableOutput(output, model, maxTokens)
-
-  const parsed = parseJudgeJson(output.text)
   return criteria.map((c, i) => ({
     criteria: c.criteria,
     weight: c.weight ?? 1,
-    met: parsed[i]?.met ?? false,
-    reason: parsed[i]?.reason ?? 'no verdict returned',
+    met: parsed[i].met,
+    reason: parsed[i].reason,
   }))
 }
 
@@ -284,6 +308,11 @@ function assertUsableOutput(output: JudgeOutput, model: string, maxTokens: numbe
         `model id is valid for this provider.`,
     )
   }
+}
+
+/** Fewer verdicts than criteria, or any verdict without a reason. */
+function incomplete(parsed: Array<{ reason: string }>, n: number): boolean {
+  return parsed.length < n || parsed.slice(0, n).some((p) => !p.reason.trim())
 }
 
 function parseJudgeJson(text: string): Array<{ met: boolean; reason: string }> {

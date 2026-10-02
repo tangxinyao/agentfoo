@@ -1,9 +1,10 @@
 import { expect } from 'vitest'
-import type { Rubric, SatisfyOptions, Trace } from './types.js'
+import type { JudgeRecord, JudgeResult, Rubric, SatisfyOptions, SatisfyTarget, Trace } from './types.js'
 import { SkillHandle } from './skill.js'
 import { judge as runJudge, defaultThreshold } from './judge.js'
 import { loadConfig } from './config-runtime.js'
-import { withHeartbeat } from './progress.js'
+import { progress, withHeartbeat } from './progress.js'
+import { nextJudgeIndex, recordJudgeArtifact, recordTriggerArtifact } from './artifacts.js'
 
 /**
  * Custom matchers (§5).
@@ -16,9 +17,23 @@ import { withHeartbeat } from './progress.js'
  *   a {@link SkillHandle}.
  */
 
-function satisfyTarget(received: unknown): { label: string; text: string } {
-  if (typeof received === 'string') return { label: 'string', text: received }
-  if (isTrace(received)) return { label: 'trace', text: received.text() }
+/**
+ * Pick the text the judge sees. A Trace defaults to its `finalMessage`: the full
+ * transcript includes tool results, and for agents that load a skill by reading
+ * SKILL.md (pi, openclaw) the skill's own instructions — "explain the analogy's
+ * limits", "correct a common misconception" — would be graded as the answer.
+ * Measured on pi: the same weak answer passed 3/3 as a transcript, 1/3 alone.
+ */
+function satisfyTarget(
+  received: unknown,
+  target: SatisfyTarget = 'final',
+): { target: JudgeRecord['target']; text: string } {
+  if (typeof received === 'string') return { target: 'string', text: received }
+  if (isTrace(received)) {
+    return target === 'transcript'
+      ? { target, text: received.text() }
+      : { target, text: received.finalMessage }
+  }
   throw new Error('toSatisfy expects a Trace, trace.finalMessage string, or any string.')
 }
 
@@ -28,22 +43,67 @@ function isTrace(v: unknown): v is Trace {
 
 expect.extend({
   async toSatisfy(received: unknown, rubric: Rubric, options: SatisfyOptions = {}) {
-    const { text } = satisfyTarget(received)
+    // Trigger-only runs (`agentfoo optimize-description`) measure whether a skill
+    // fires, not how well it writes: skip the judge — and its cost — entirely.
+    if (process.env.AGENTFOO_TRIGGER_ONLY === '1') {
+      return { pass: !this.isNot, message: () => 'toSatisfy skipped (AGENTFOO_TRIGGER_ONLY=1)' }
+    }
+    // Read before the first await: concurrent tests interleave after that point.
+    const testName = takeAssertionTest() ?? this.currentTestName ?? expect.getState().currentTestName ?? 'unknown'
+    const { target, text } = satisfyTarget(received, options.target)
     const cfg = loadConfig()
     const model = options.model ?? cfg.judge.model
     const threshold = options.threshold ?? defaultThreshold(rubric)
 
+    const samples = Math.max(1, Math.floor(options.samples ?? cfg.judge.samples ?? 1))
+
     const criteria = Array.isArray(rubric) ? rubric.length : 1
-    const result = await withHeartbeat(
-      `judging (${model}, ${criteria} ${criteria === 1 ? 'criterion' : 'criteria'})`,
+    const results = await withHeartbeat(
+      `judging (${model}, ${criteria} ${criteria === 1 ? 'criterion' : 'criteria'}` +
+        `${samples > 1 ? `, ×${samples}` : ''})`,
       // Spread the whole configured judge block, not just the model: baseUrl,
       // apiKeyEnv and maxTokens are all part of "how to reach the judge" and
       // silently dropping them makes a configured endpoint/key look ignored.
-      () => runJudge(text, rubric, { ...cfg.judge, model }, threshold),
+      () =>
+        Promise.all(
+          Array.from({ length: samples }, () => runJudge(text, rubric, { ...cfg.judge, model }, threshold)),
+        ),
     )
+    const result = aggregate(results, threshold)
+    const scores = results.map((r) => r.score)
+    const sd = stdev(scores)
+
+    progress(
+      `  score ${result.score.toFixed(2)}${samples > 1 ? `±${sd.toFixed(2)} (n=${samples})` : ''} ` +
+        `${result.passed ? '≥' : '<'} ${threshold.toFixed(2)}` +
+        (result.passed ? '' : ` — ${result.breakdown.filter((b) => !b.met).length} unmet`),
+    )
+    try {
+      recordJudgeArtifact({
+        test: testName,
+        index: nextJudgeIndex(testName),
+        model,
+        target,
+        threshold,
+        score: result.score,
+        passed: result.passed,
+        breakdown: result.breakdown,
+        samples,
+        scores,
+        stdev: sd,
+        gradedAt: new Date().toISOString(),
+      })
+    } catch {
+      // Artifact writing must never fail a test.
+    }
 
     const summary = result.breakdown
-      .map((b) => `  ${b.met ? '✓' : '✗'} (${b.weight}) ${b.criteria}\n      ↳ ${b.reason}`)
+      .map(
+        (b) =>
+          `  ${b.met ? '✓' : '✗'} (${b.weight}) ${b.criteria}` +
+          `${b.metRate !== undefined ? ` [met ${Math.round(b.metRate * samples)}/${samples}]` : ''}` +
+          `\n      ↳ ${b.reason}`,
+      )
       .join('\n')
 
     return {
@@ -59,6 +119,16 @@ expect.extend({
   toHaveBeenCalled(received: unknown) {
     const handle = asSkill(received)
     const calls = handle.calls()
+    try {
+      recordTriggerArtifact({
+        test: takeAssertionTest() ?? this.currentTestName ?? expect.getState().currentTestName ?? 'unknown',
+        skill: handle.name,
+        called: calls.length > 0,
+        expected: !this.isNot,
+      })
+    } catch {
+      // Artifact writing must never fail a test.
+    }
     return {
       pass: calls.length > 0,
       message: () =>
@@ -83,6 +153,31 @@ expect.extend({
     }
   },
 })
+
+/**
+ * Fold several gradings of the same text into one. The score is the mean of the
+ * sample scores (not re-derived from majority verdicts, so a criterion met 2/3 of
+ * the time still costs a third of its weight); each criterion's `met` is the
+ * majority and `metRate` the fraction, with the reason taken from a sample that
+ * agrees with the majority. A single sample passes through unchanged.
+ */
+export function aggregate(results: JudgeResult[], threshold: number): JudgeResult {
+  if (results.length === 1) return results[0]
+  const score = results.reduce((s, r) => s + r.score, 0) / results.length
+  const breakdown = results[0].breakdown.map((first, i) => {
+    const verdicts = results.map((r) => r.breakdown[i])
+    const metRate = verdicts.filter((v) => v?.met).length / results.length
+    const met = metRate > 0.5
+    const agreeing = verdicts.find((v) => v && v.met === met) ?? first
+    return { criteria: first.criteria, weight: first.weight, met, reason: agreeing.reason, metRate }
+  })
+  return { passed: score >= threshold, score, threshold, breakdown }
+}
+
+function stdev(xs: number[]): number {
+  const mean = xs.reduce((s, x) => s + x, 0) / xs.length
+  return Math.sqrt(xs.reduce((s, x) => s + (x - mean) ** 2, 0) / xs.length)
+}
 
 /**
  * Explain a failing `toHaveBeenCalled` by listing the tool calls that *were*
@@ -135,6 +230,94 @@ function deepEqual(a: unknown, b: unknown): boolean {
   }
   return false
 }
+
+/**
+ * Keep agentfoo's `toSatisfy` in place on chai's shared `Assertion.prototype`.
+ *
+ * vitest ships its own `toSatisfy(predicate)` and re-registers it every time it
+ * builds a test-context `expect` — which happens lazily, the moment a test
+ * destructures `({ expect })`, as `test.concurrent` requires. That assignment
+ * lands on the same prototype, so after the first such test every
+ * `toSatisfy(rubric)` in the file, global `expect` included, silently became
+ * vitest's predicate matcher and failed with "expected is not a function".
+ *
+ * chai's `addMethod` assigns (`proto[name] = fn`), so an accessor catches it: the
+ * setter keeps vitest's version as the fallback, and the getter dispatches — a
+ * function argument goes to vitest's predicate matcher, anything else (a
+ * rubric) to ours. Both keep working, whichever registered last.
+ */
+/**
+ * The test an assertion belongs to. A matcher's `this.currentTestName` comes from
+ * the `expect` that *registered* it (the global one), so under `test.concurrent`
+ * it names whichever test started last — gradings and trigger records landed
+ * on the wrong cases. vitest does tag every assertion with its own test
+ * (`vitest-test` flag); the prototype wrappers below read it off the assertion
+ * right before delegating, and the matcher takes it synchronously.
+ */
+let assertionTest: string | undefined
+
+function takeAssertionTest(): string | undefined {
+  const t = assertionTest
+  assertionTest = undefined
+  return t
+}
+
+interface TaskLike {
+  name: string
+  suite?: (TaskLike & { filepath?: string }) | undefined
+}
+
+function noteAssertionTest(assertion: unknown): void {
+  const task = (assertion as { __flags?: Record<string, unknown> } | undefined)?.__flags?.['vitest-test'] as TaskLike | undefined
+  if (!task?.name) {
+    assertionTest = undefined
+    return
+  }
+  const names = [task.name]
+  for (let s = task.suite; s && !('filepath' in s && s.filepath); s = s.suite) names.unshift(s.name)
+  assertionTest = names.join(' > ')
+}
+
+/** Prototype methods already wrapped (chai proxies its methods, so no marker property on them). */
+const tagged = new WeakSet<object>()
+
+/** Wrap agentfoo's spy matchers so they know which test is asserting (see {@link noteAssertionTest}). */
+function tagSpyMatchers(): void {
+  const proto = Object.getPrototypeOf(expect(null)) as Record<string, (...args: unknown[]) => unknown>
+  for (const name of ['toHaveBeenCalled', 'toHaveBeenCalledWith']) {
+    const original = Object.getOwnPropertyDescriptor(proto, name)?.value as ((...args: unknown[]) => unknown) | undefined
+    if (typeof original !== 'function' || tagged.has(original)) continue
+    const wrapped = function (this: unknown, ...args: unknown[]) {
+      noteAssertionTest(this)
+      return original.apply(this, args)
+    }
+    tagged.add(wrapped)
+    Object.defineProperty(proto, name, { value: wrapped, writable: true, configurable: true })
+  }
+}
+tagSpyMatchers()
+
+function pinToSatisfy(): void {
+  const proto = Object.getPrototypeOf(expect(null)) as Record<string, unknown>
+  const current = Object.getOwnPropertyDescriptor(proto, 'toSatisfy')
+  if (!current || current.get) return // absent, or already pinned
+  const ours = current.value as (...args: unknown[]) => unknown
+  let builtin: ((...args: unknown[]) => unknown) | undefined
+  const dispatch = function (this: unknown, ...args: unknown[]) {
+    if (typeof args[0] === 'function' && builtin) return builtin.apply(this, args)
+    noteAssertionTest(this)
+    return ours.apply(this, args)
+  }
+  Object.defineProperty(proto, 'toSatisfy', {
+    configurable: true,
+    enumerable: current.enumerable,
+    get: () => dispatch,
+    set: (fn: (...args: unknown[]) => unknown) => {
+      builtin = fn
+    },
+  })
+}
+pinToSatisfy()
 
 interface AgentfooMatchers<R = unknown> {
   /** Assert the skill handle was invoked at least once. */

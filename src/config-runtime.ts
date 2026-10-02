@@ -14,12 +14,14 @@ export interface ResolvedConfig {
   judge: JudgeConfig
   agents: Record<string, AgentConfig>
   retries: number
+  concurrency: number
 }
 
 const DEFAULTS: ResolvedConfig = {
   judge: { model: 'anthropic/claude-opus-4-8' },
   agents: {},
   retries: 0,
+  concurrency: 1,
 }
 
 let cached: ResolvedConfig | undefined
@@ -36,6 +38,7 @@ export function loadConfig(): ResolvedConfig {
     judge: { ...DEFAULTS.judge, ...parsed.judge },
     agents: parsed.agents ?? {},
     retries: parsed.retries ?? 0,
+    concurrency: Math.max(1, Math.floor(parsed.concurrency ?? 1)),
   }
   return cached
 }

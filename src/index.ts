@@ -13,9 +13,12 @@ import './matchers.js'
 // Re-export vitest primitives unchanged (§4: "use vitest's native DSL").
 export { test, expect, describe, it, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
 
-export { bootAgent } from './fixtures.js'
+export { bootAgent, createAgentPool, testNameOf } from './fixtures.js'
+export type { AgentPool, AgentPoolOptions } from './fixtures.js'
 export { selectedAgentKind } from './config-runtime.js'
 export { retry } from './retry.js'
+export { converse } from './converse.js'
+export type { Conversation, ConversationTurn, ConverseOptions, Responder } from './converse.js'
 export { OpencodeAgent } from './agent/opencode.js'
 export {
   AcpxAgent,
@@ -44,7 +47,7 @@ export {
   renderOpenclawJson,
   OPENCLAW_GATEWAY_PORT,
 } from './agent/openclaw.js'
-export type { Agent, AgentBootOptions } from './agent/types.js'
+export type { Agent, AgentBootOptions, RunOptions } from './agent/types.js'
 export {
   SkillHandle,
   setSkillDetector,
@@ -79,8 +82,10 @@ export type {
   Rubric,
   RubricCriterion,
   SatisfyOptions,
+  SatisfyTarget,
   RetryOptions,
   RetryPolicy,
   JudgeResult,
+  JudgeRecord,
 } from './types.js'
 export type { SkillDetector } from './skill.js'

@@ -21,6 +21,7 @@ export function defineConfig(config: AgentfooConfig = {}): UserConfig {
   // overridable per project via `timeout` (ms). Boot (§4, docker build +
   // container start) runs in the file fixture, hence the same hookTimeout.
   const testTimeout = timeout ?? 300_000
+  const concurrency = Math.max(1, Math.floor(config.concurrency ?? 1))
 
   // In-repo self-reference so example specs can `import from 'agentfoo'` against
   // the raw sources. Only valid when running from `src/` — a `.ts` sibling of
@@ -44,13 +45,16 @@ export function defineConfig(config: AgentfooConfig = {}): UserConfig {
       // runs are serialized (fileParallelism:false, maxConcurrency:1) so lines
       // never interleave across cases.
       disableConsoleIntercept: true,
-      // Slow, external-resource tests: run strictly one case at a time so
-      // containers/LLM calls don't stampede. `fileParallelism: false` serializes
+      // Slow, external-resource tests: by default run strictly one case at a time
+      // so containers/LLM calls don't stampede. `fileParallelism: false` serializes
       // across spec files; `maxConcurrency: 1` + `sequence.concurrent: false`
-      // serialize the `test()`s *within* a file too (even if marked `.concurrent`),
-      // so no two agent runs are ever in flight simultaneously.
+      // serialize the `test()`s *within* a file too (even if marked `.concurrent`).
+      // `concurrency: n` lifts only the second: tests explicitly marked
+      // `.concurrent` then run n at a time, each on its own pooled agent
+      // (createAgentPool) — n, not vitest's default 5, so no test sits in the
+      // queue for an agent while its own timeout runs.
       fileParallelism: false,
-      maxConcurrency: 1,
+      maxConcurrency: concurrency,
       sequence: { concurrent: false },
       // NB: agentfoo does *not* wire `retries` into vitest's global `test.retry`
       // — §5 requires retry to be opt-in per assertion block (via `retry()`), not
@@ -65,6 +69,11 @@ export function defineConfig(config: AgentfooConfig = {}): UserConfig {
         // `-a/--agent`. Forwarded explicitly rather than relying on ambient
         // inheritance so it reaches workers under every vitest pool.
         ...(process.env.AGENTFOO_AGENT ? { AGENTFOO_AGENT: process.env.AGENTFOO_AGENT } : {}),
+        // Candidate-skill redirection set by `agentfoo optimize` (resolveSkillOverride).
+        ...(process.env.AGENTFOO_TRIGGER_ONLY ? { AGENTFOO_TRIGGER_ONLY: process.env.AGENTFOO_TRIGGER_ONLY } : {}),
+        ...(process.env.AGENTFOO_SKILL_OVERRIDES
+          ? { AGENTFOO_SKILL_OVERRIDES: process.env.AGENTFOO_SKILL_OVERRIDES }
+          : {}),
       },
     },
   }

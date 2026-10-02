@@ -173,3 +173,34 @@ describe('judge output-token budget', () => {
     ).rejects.toThrow(/output cap/)
   })
 })
+
+describe('incomplete judge verdicts', () => {
+  const config = { model: 'deepseek/deepseek-v4-pro', apiKeyEnv: 'FAKE_JUDGE_KEY' }
+  const rubric = [{ criteria: 'a' }, { criteria: 'b' }]
+  const reply = (results: unknown[]) =>
+    new Response(JSON.stringify(openaiReply(JSON.stringify({ results }))), { status: 200 })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env.FAKE_JUDGE_KEY
+  })
+
+  it('asks again instead of reading a missing verdict as unmet', async () => {
+    process.env.FAKE_JUDGE_KEY = 'k'
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(reply([{ met: true, reason: 'ok' }, { met: false, reason: '' }]))
+      .mockResolvedValueOnce(reply([{ met: true, reason: 'ok' }, { met: true, reason: 'also ok' }]))
+
+    const result = await judge('t', rubric, config, 1)
+
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(result.passed).toBe(true)
+  })
+
+  it('fails loudly when the judge is incomplete twice', async () => {
+    process.env.FAKE_JUDGE_KEY = 'k'
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => reply([{ met: true, reason: 'ok' }]))
+    await expect(judge('t', rubric, config, 1)).rejects.toThrow(/1 usable verdicts for 2 criteria, twice/)
+  })
+})
